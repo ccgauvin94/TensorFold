@@ -102,3 +102,19 @@ test "an unsupported tool type is still refused" {
     const raw = try request(a, "[{\"type\":\"computer_20250124\",\"name\":\"computer\"}]");
     try std.testing.expectError(error.Refused, translate(&cx, raw, false));
 }
+
+test "the search tool names what it can find, so the model can aim" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try chat(a, "[{\"type\":\"tool_search_tool_regex_20251119\",\"name\":\"tool_search_tool_regex\"}," ++
+        "{\"name\":\"get_weather\",\"input_schema\":{\"type\":\"object\"},\"defer_loading\":true}," ++
+        "{\"name\":\"send_email\",\"input_schema\":{\"type\":\"object\"},\"defer_loading\":true}," ++
+        "{\"name\":\"search_files\",\"input_schema\":{\"type\":\"object\"}}]");
+
+    const search = body.get("tools").?.array[0];
+    const said = search.get("function").?.get("description").?.string;
+    // the deferred names are published in the search tool's own description; the eager one is not listed
+    try std.testing.expect(std.mem.indexOf(u8, said, "get_weather, send_email") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "search_files") == null);
+}
