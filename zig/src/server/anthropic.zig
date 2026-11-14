@@ -103,22 +103,126 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
         }
         break :blk .{ chat, body };
     };
-    var reply: Reply = .{ .a = a, .conn = conn, .model = openai.replyModel(srv, prepared[1]) };
-    reply.init() catch return;
-    var wire: Wire = .{ .reply = &reply };
-    openai.run(srv, a, wire.out(), .{ .conn = conn }, true, prepared[0]);
-    if (wire.opened or wire.status == null or conn.broken) return;
-    const payload = wire.payload;
-    if (wire.status.? != 200) {
-        const problem = payload.get("error") orelse Value.null;
-        const message = if (problem == .object) (if (problem.get("message")) |m| (if (m == .string) m.string else "request failed") else "request failed") else (if (problem == .string) problem.string else "request failed");
-        return sendError(conn, a, message, wire.status.?);
-    }
-    const whole = reply.completion(payload) catch |e| {
-        const message = std.fmt.allocPrint(a, "invalid model response: {s}", .{reply.problem orelse @errorName(e)}) catch return;
-        return sendError(conn, a, message, 500);
+    const body_streamed = json.truthyField(prepared[1], "stream");
+    const declared = tool_specs.active(&cx, prepared[0].get("tools"), prepared[0].get("tool_choice")) catch {
+        return sendError(conn, a, cx.message, 400);
     };
-    routes.sendValue(conn, a, 200, whole);
+    if (body_streamed and srv.config.tool_search) for (declared) |tool| {
+        if (tool.get("x_tensorfold_server_tool") == null) continue;
+        // a search's blocks land mid-message, which the stream cannot carry yet: refuse rather than half-serve it
+        return sendError(conn, a, "streaming a tool search is not supported yet: send stream: false", 400);
+    };
+    const chat_body = prepared[0]; // the maps inside it are mutated between rounds
+    var blocks: std.ArrayList(Value) = .empty;
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        var reply: Reply = .{ .a = a, .conn = conn, .model = openai.replyModel(srv, prepared[1]) };
+        reply.init() catch return;
+        var wire: Wire = .{ .reply = &reply };
+        openai.run(srv, a, wire.out(), .{ .conn = conn }, true, chat_body);
+        if (wire.opened or wire.status == null or conn.broken) return;
+        const payload = wire.payload;
+        if (wire.status.? != 200) {
+            const problem = payload.get("error") orelse Value.null;
+            const message = if (problem == .object) (if (problem.get("message")) |m| (if (m == .string) m.string else "request failed") else "request failed") else (if (problem == .string) problem.string else "request failed");
+            return sendError(conn, a, message, wire.status.?);
+        }
+        const answered = answerSearchRound(a, srv, &blocks, declared, payload, chat_body) catch return;
+        if (answered) {
+            if (rounds >= max_search_rounds) return sendError(conn, a, "the model kept searching for tools without answering", 503);
+            continue;
+        }
+        const whole = reply.completion(payload) catch |e| {
+            const message = std.fmt.allocPrint(a, "invalid model response: {s}", .{reply.problem orelse @errorName(e)}) catch return;
+            return sendError(conn, a, message, 500);
+        };
+        splice(a, whole, blocks.items) catch return;
+        return routes.sendValue(conn, a, 200, whole);
+    }
+}
+
+
+/// How many searches one reply may make before it must answer (`--tool-search`): enough for a couple of hops, few
+/// enough that a model that keeps searching cannot spin.
+const max_search_rounds = 4;
+
+/// Whether ``name`` is one of the tools this request declared as a server tool (a tool search).
+fn serverTool(declared: []const Value, name: []const u8) bool {
+    for (declared) |tool| {
+        if (tool.get("x_tensorfold_server_tool") == null) continue;
+        const function = tool.get("function") orelse continue;
+        if (function != .object) continue;
+        const declared_name = function.get("name") orelse continue;
+        if (declared_name == .string and std.mem.eql(u8, declared_name.string, name)) return true;
+    }
+    return false;
+}
+
+/// Answers the search a finished round called, if it called one: appends the contract's two blocks to ``blocks``
+/// and extends ``body`` with the turns the continuation needs — the assistant turn it produced with the call
+/// rendered canonically, then the expansion. Returns false when the round called no server tool.
+fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), declared: []const Value, payload: Value, body: Value) !bool {
+    const choices = payload.get("choices") orelse return false;
+    if (choices != .array or choices.array.len == 0) return false;
+    const message = choices.array[0].get("message") orelse return false;
+    const calls = message.get("tool_calls") orelse return false;
+    if (calls != .array or calls.array.len == 0) return false;
+
+    var call: ?tool_search.SearchCall = null;
+    for (calls.array) |entry| {
+        const function = entry.get("function") orelse continue;
+        if (function != .object) continue;
+        const name = function.get("name") orelse continue;
+        if (name != .string or !serverTool(declared, name.string)) continue;
+        const raw = function.get("arguments") orelse Value.null;
+        const input = if (raw == .string) switch (try json.parseText(a, raw.string)) {
+            .ok => |v| v,
+            .err => Value.null,
+        } else raw;
+        call = .{ .id = entry.get("id") orelse Value.null, .name = name.string, .input = input };
+        break;
+    }
+    const found = call orelse return false;
+
+    const variant: tool_search.Variant = if (found.input == .object and found.input.get("query") != null) .bm25 else .regex;
+    const outcome = try tool_search.run(a, declared, variant, found.input);
+    const id = try std.fmt.allocPrint(a, "srvtoolu_{d}", .{blocks.items.len + 1});
+    try blocks.append(a, try tool_search.serverToolUse(a, id, found.name, found.input));
+    switch (outcome) {
+        .found => |names| try blocks.append(a, try tool_search.result(a, id, names)),
+        .failed => |why| try blocks.append(a, try tool_search.failure(a, id, why)),
+    }
+
+    // the continuation: everything so far, then the assistant turn as the prompt will render it on replay, then the
+    // expansion in the server's late-system role
+    const messages = body.get("messages") orelse Value{ .array = &.{} };
+    var out: std.ArrayList(Value) = .empty;
+    if (messages == .array) for (messages.array) |m| try out.append(a, m);
+    var parts: std.ArrayList(Value) = .empty;
+    if (message.get("content")) |prose| {
+        if (prose == .string and prose.string.len > 0) try parts.append(a, try messages_mod.textPart(a, prose.string));
+    }
+    try parts.append(a, try messages_mod.textPart(a, try tool_search.callText(a, variant, found.input)));
+    const turn = try json.newObject(a);
+    try turn.put(a, "role", .{ .string = "assistant" });
+    try turn.put(a, "content", .{ .array = parts.items });
+    try out.append(a, .{ .object = turn });
+    const expansion = switch (outcome) {
+        .found => |names| try tool_search.derive(a, srv.late_system, declared, variant, found.input, names),
+        .failed => null,
+    };
+    if (expansion) |derived| try out.append(a, derived.expansion);
+    try body.object.put(a, "messages", .{ .array = out.items });
+    return true;
+}
+
+/// The blocks the searches produced, in front of the last round's content.
+fn splice(a: Allocator, whole: Value, blocks: []const Value) Allocator.Error!void {
+    if (blocks.len == 0 or whole != .object) return;
+    const content = whole.get("content") orelse return;
+    if (content != .array) return;
+    const all = try std.mem.concat(a, Value, &.{ blocks, content.array });
+    try whole.object.put(a, "content", .{ .array = all });
 }
 
 const Wire = struct {
