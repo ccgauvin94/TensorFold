@@ -198,3 +198,40 @@ test "the expansion message carries the search and its definitions" {
     const again = try search.expansionMessage(a, "system", "pattern", "weather", &found_names, list);
     try std.testing.expectEqualStrings(text, again.get("content").?.string);
 }
+
+test "a replayed search derives exactly the turns the live request appended" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = try tools(a);
+
+    const refs = [_][]const u8{"get_weather"};
+    const live_input = try args(a, "{\"pattern\":\"weather\"}");
+
+    // live: what the round writes into the conversation when it runs the search
+    const live = try search.derive(a, "system", list, .regex, live_input, &refs);
+
+    // replay: the two blocks a client echoes back — the call's input and the result's references, nothing else.
+    // The id is deliberately different from the one the live request used: it never reaches the prompt.
+    const blocks = try args(a,
+        \\[{"type":"server_tool_use","id":"srvtoolu_replayed","name":"tool_search_tool_regex","input":{"pattern":"weather"}},
+        \\ {"type":"tool_search_tool_result","tool_use_id":"srvtoolu_replayed","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}]
+    );
+    const echoed_input = blocks.array[0].get("input").?;
+    const echoed_refs = [_][]const u8{"get_weather"};
+    const replayed = try search.derive(a, "system", list, .regex, echoed_input, &echoed_refs);
+
+    try std.testing.expectEqualStrings(live.call, replayed.call);
+    try std.testing.expectEqualStrings(live.expansion.get("content").?.string, replayed.expansion.get("content").?.string);
+    try std.testing.expectEqualStrings("system", replayed.expansion.get("role").?.string);
+
+    // bookkeeping never reaches the prompt, so a client that rewrites an id cannot move the prefix
+    try std.testing.expect(std.mem.indexOf(u8, replayed.call, "srvtoolu") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replayed.expansion.get("content").?.string, "srvtoolu") == null);
+    // the call line is the inputs, in one order, and reads as a search
+    try std.testing.expectEqualStrings("Tool search: pattern=\"weather\"", replayed.call);
+
+    // a limit is part of the inputs and so part of the canonical line
+    const with_limit = try search.derive(a, "system", list, .bm25, try args(a, "{\"query\":\"weather\",\"limit\":3}"), &refs);
+    try std.testing.expectEqualStrings("Tool search: query=\"weather\", limit=3", with_limit.call);
+}

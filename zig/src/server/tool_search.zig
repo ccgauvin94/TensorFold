@@ -446,3 +446,54 @@ pub fn expansionMessage(a: Allocator, role: []const u8, leaf: []const u8, query:
     try o.put(a, "content", .{ .string = text.items });
     return .{ .object = o };
 }
+
+/// ---------------------------------------------------------------------------------------------------------------
+/// Replay fidelity. A client echoes the two blocks back and nothing else: the call's ``id``, ``name`` and
+/// ``input``, and the result's ``tool_references``. It never echoes the markup the model wrote, so the prompt must
+/// carry a CANONICAL rendering of the call derived from the block — the model's own DSML cannot be reconstructed,
+/// and keeping it would move the prompt one byte and cost the prefix cache at exactly the point discovery happens.
+/// The id and the tool's own name stay out of the text for the same reason: they are wire bookkeeping, not context.
+/// ---------------------------------------------------------------------------------------------------------------
+
+fn leafOf(variant: Variant) []const u8 {
+    return switch (variant) {
+        .regex => "pattern",
+        .bm25 => "query",
+    };
+}
+
+fn stringField(input: Value, name: []const u8) []const u8 {
+    if (input != .object) return "";
+    const v = input.get(name) orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+/// The canonical line a search leaves in the conversation: ``Tool search: pattern="weather", limit=5``. Built from
+/// the call's inputs only, in one order, so the turn a live request writes and the turn a replay re-derives are the
+/// same bytes.
+pub fn callText(a: Allocator, variant: Variant, input: Value) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "Tool search: ");
+    try out.appendSlice(a, leafOf(variant));
+    try out.appendSlice(a, "=\"");
+    try out.appendSlice(a, stringField(input, leafOf(variant)));
+    try out.append(a, '"');
+    if (input == .object) {
+        if (input.get("limit")) |l| {
+            if (l.int64()) |n| try out.appendSlice(a, try std.fmt.allocPrint(a, ", limit={d}", .{n}));
+        }
+    }
+    return out.items;
+}
+
+/// The two turns a search leaves behind — the canonical call line and the expansion message — derived from the
+/// call's input and the result's references alone. One function for both directions: what the round appends when
+/// the search runs, and what a later request re-derives from the echoed blocks.
+pub const Derived = struct { call: []const u8, expansion: Value };
+
+pub fn derive(a: Allocator, role: []const u8, tools: []const Value, variant: Variant, input: Value, refs: []const []const u8) Allocator.Error!Derived {
+    return .{
+        .call = try callText(a, variant, input),
+        .expansion = try expansionMessage(a, role, leafOf(variant), stringField(input, leafOf(variant)), refs, tools),
+    };
+}
