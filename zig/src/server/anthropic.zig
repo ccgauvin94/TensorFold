@@ -107,12 +107,12 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     const declared = tool_specs.active(&cx, prepared[0].get("tools"), prepared[0].get("tool_choice")) catch {
         return sendError(conn, a, cx.message, 400);
     };
-    if (body_streamed and srv.config.tool_search) for (declared) |tool| {
-        if (tool.get("x_tensorfold_server_tool") == null) continue;
-        // a search's blocks land mid-message, which the stream cannot carry yet: refuse rather than half-serve it
-        return sendError(conn, a, "streaming a tool search is not supported yet: send stream: false", 400);
-    };
+    // A reply that may carry a search is assembled before it is streamed: the search blocks land mid-message and the
+    // rounds after them continue the same message, which the incremental path cannot open yet. The rounds run
+    // without streaming and the finished message is emitted as the events it would have produced.
+    const buffered_search = body_streamed and srv.config.tool_search and anyServerTool(declared);
     const chat_body = prepared[0]; // the maps inside it are mutated between rounds
+    if (buffered_search) chat_body.object.put(a, "stream", .{ .bool = false }) catch return;
     var blocks: std.ArrayList(Value) = .empty;
     var rounds: usize = 0;
     while (true) : (rounds += 1) {
@@ -137,10 +137,82 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             return sendError(conn, a, message, 500);
         };
         splice(a, whole, blocks.items) catch return;
+        if (buffered_search) return emitAsSse(conn, a, whole);
         return routes.sendValue(conn, a, 200, whole);
     }
 }
 
+
+
+/// Whether this request declares one of the engine's own search tools.
+fn anyServerTool(declared: []const Value) bool {
+    for (declared) |tool| if (tool.get("x_tensorfold_server_tool") != null) return true;
+    return false;
+}
+
+/// A finished message as the event stream the same reply would have produced: the search blocks land mid-message
+/// and the rounds after them continue it, so a reply that may carry one is assembled first and then emitted.
+fn emitAsSse(conn: *Conn, a: Allocator, whole: Value) void {
+    if (whole != .object) return;
+    sse.open(conn) catch return;
+    const head = json.copyObject(a, whole.object) catch return;
+    head.put(a, "content", .{ .array = &.{} }) catch return;
+    head.put(a, "stop_reason", .null) catch return;
+    head.put(a, "stop_sequence", .null) catch return;
+    const opened = json.newObject(a) catch return;
+    opened.put(a, "type", .{ .string = "message_start" }) catch return;
+    opened.put(a, "message", .{ .object = head }) catch return;
+    sse.event(conn, a, "message_start", .{ .object = opened }) catch return;
+
+    const content = whole.get("content") orelse Value{ .array = &.{} };
+    if (content == .array) {
+        for (content.array, 0..) |block, at| {
+        const index: i64 = @intCast(at);
+        const kind = if (block == .object) (block.strField("type") orelse "") else "";
+        const start = json.newObject(a) catch return;
+        start.put(a, "type", .{ .string = "content_block_start" }) catch return;
+        start.put(a, "index", json.intValue(a, index) catch return) catch return;
+        start.put(a, "content_block", block) catch return;
+        sse.event(conn, a, "content_block_start", .{ .object = start }) catch return;
+
+        // the block's changing part arrives as deltas on the block the start opened
+        const delta = json.newObject(a) catch return;
+        delta.put(a, "type", .{ .string = "content_block_delta" }) catch return;
+        delta.put(a, "index", json.intValue(a, index) catch return) catch return;
+        const inner = json.newObject(a) catch return;
+        if (std.mem.eql(u8, kind, "text")) {
+            inner.put(a, "type", .{ .string = "text_delta" }) catch return;
+            inner.put(a, "text", block.get("text") orelse Value.null) catch return;
+        } else if (std.mem.eql(u8, kind, "thinking")) {
+            inner.put(a, "type", .{ .string = "thinking_delta" }) catch return;
+            inner.put(a, "thinking", block.get("thinking") orelse Value.null) catch return;
+        } else if (std.mem.eql(u8, kind, "tool_use")) {
+            inner.put(a, "type", .{ .string = "input_json_delta" }) catch return;
+            inner.put(a, "partial_json", .{ .string = json.stringify(a, block.get("input") orelse Value.null, .{ .compact = true }) catch return }) catch return;
+        }
+        if (inner.get("type") != null) {
+            delta.put(a, "delta", .{ .object = inner }) catch return;
+            sse.event(conn, a, "content_block_delta", .{ .object = delta }) catch return;
+        }
+        const stop = json.newObject(a) catch return;
+        stop.put(a, "type", .{ .string = "content_block_stop" }) catch return;
+        stop.put(a, "index", json.intValue(a, index) catch return) catch return;
+            sse.event(conn, a, "content_block_stop", .{ .object = stop }) catch return;
+        }
+    }
+
+    const tail = json.newObject(a) catch return;
+    tail.put(a, "type", .{ .string = "message_delta" }) catch return;
+    const move = json.newObject(a) catch return;
+    move.put(a, "stop_reason", whole.get("stop_reason") orelse Value.null) catch return;
+    move.put(a, "stop_sequence", whole.get("stop_sequence") orelse Value.null) catch return;
+    tail.put(a, "delta", .{ .object = move }) catch return;
+    tail.put(a, "usage", whole.get("usage") orelse Value.null) catch return;
+    sse.event(conn, a, "message_delta", .{ .object = tail }) catch return;
+    const end = json.newObject(a) catch return;
+    end.put(a, "type", .{ .string = "message_stop" }) catch return;
+    sse.event(conn, a, "message_stop", .{ .object = end }) catch return;
+}
 
 /// A search call the model made in a round: the id it gave, the tool it named, and its inputs.
 const SearchCall = struct { id: Value, name: []const u8, input: Value };
