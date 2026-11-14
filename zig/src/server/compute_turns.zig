@@ -72,6 +72,9 @@ pub fn requestTools(srv: *Server, cx: *Cx, body: Value, input: *chat.Input, logp
     const thinking = (try @import("fields.zig").thinkingFields(cx, body, srv.effort_levels)).enable orelse srv.config.enable_thinking;
     const fit: Fit = .{ .max_tokens = budget, .thinking = thinking, .stop = json.truthyField(body, "stop"), .logprobs = logprobs or json.truthyField(body, "prompt_logprobs"), .structured = structured };
     input.tools = try tools(srv, cx, body.get("tools"), body.get("tool_choice"), fit);
+    // Anthropic deferred loading: the template shows the published subset, while parsing and streaming keep every
+    // declared tool so a discovered one's call still parses.
+    if (tool_specs.anyDeferred(input.tools)) input.published = try tool_specs.published(cx.a, input.tools);
     input.lane_own = ownedByServer(srv, body.get("tools"), input.tools);
 }
 

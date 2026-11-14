@@ -113,15 +113,17 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         .ids => |ids| return .{ .ids = ids },
     };
     cx.response_format = input.fields.get("response_format");
-    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
-    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+    // Deferred tools are declared but not shown: the template renders the published subset.
+    const shown = input.published orelse input.tools;
+    const prompt = try renderIds(srv, cx, input.messages, shown, thinking, effort, true);
+    const history = try renderIds(srv, cx, input.messages, shown, thinking, effort, false);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
     // --vision: placeholders expanded to image tokens before the window, chunks and cache see it; no rewind kept
     if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, input.messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
     const count = if (input.messages == .array) input.messages.array.len else 0;
-    const rewind_len = if (srv.info.prompt_cache) rewindLen(srv, cx, input.messages, count, input.tools, prompt, thinking, effort) else 0; // one more render
+    const rewind_len = if (srv.info.prompt_cache) rewindLen(srv, cx, input.messages, count, shown, prompt, thinking, effort) else 0; // one more render
     return .{ .ids = prompt, .history_len = history_len, .rewind_len = rewind_len, .user_end = userEnd(input.messages, history_len) };
 }
 

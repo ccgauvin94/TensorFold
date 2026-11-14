@@ -95,3 +95,23 @@ pub fn active(cx: *Cx, tools: ?Value, choice: ?Value) errors.Refused![]Value {
     if (named.items.len == 0) return cx.fail(.other, "tool_choice requested unknown tool '{s}'", .{requested});
     return named.items;
 }
+
+/// Anthropic's ``defer_loading``: the definition travels with every request so the engine can expand a search's
+/// references, but stays out of the prompt's tool block until one does. The tool stays declared, so a call to it
+/// parses and grammars like any other.
+pub fn deferred(tool: Value) bool {
+    return tool == .object and json.truthyField(tool, "defer_loading");
+}
+
+pub fn anyDeferred(tools: []const Value) bool {
+    for (tools) |tool| if (deferred(tool)) return true;
+    return false;
+}
+
+/// The tools the template shows: every declared tool but the deferred ones. Empty when nothing is deferred, so a
+/// caller sets it only when ``anyDeferred`` says the request defers (null means "render the declared list").
+pub fn published(a: Allocator, tools: []const Value) Allocator.Error![]const Value {
+    var out: std.ArrayList(Value) = .empty;
+    for (tools) |tool| if (!deferred(tool)) try out.append(a, tool);
+    return out.items;
+}

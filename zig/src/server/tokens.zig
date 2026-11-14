@@ -31,10 +31,12 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     if (body.has("messages")) {
         const generation = try flag(cx, body, "add_generation_prompt", true);
         const msgs = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
-        const tools = tool_specs.active(cx, body.get("tools"), body.get("tool_choice")) catch |e| switch (e) {
+        const declared = tool_specs.active(cx, body.get("tools"), body.get("tool_choice")) catch |e| switch (e) {
             error.Refused => return cx.refuse(cx.message), // a ValueError here is a RequestError
             else => |x| return x,
         };
+        // a deferred tool is declared but not shown: the count is what the prompt renders
+        const tools = if (tool_specs.anyDeferred(declared)) try tool_specs.published(cx.a, declared) else declared;
         const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
         const on = thinking.enable orelse srv.config.enable_thinking;
         cx.clear_thinking = thinking.clear;

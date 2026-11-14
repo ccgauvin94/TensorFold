@@ -24,6 +24,9 @@ pub const Prompt = union(enum) { text: []const u8, ids: []const u32 };
 pub const Input = struct {
     messages: Value = .{ .array = &.{} },
     tools: []const Value = &.{},
+    /// Anthropic deferred loading: the declared tools the template shows (every tool but the deferred ones).
+    /// Null renders all of ``tools``. Parsing, streaming and grammar keep using ``tools`` either way.
+    published: ?[]const Value = null,
     prompt: ?Prompt = null,
     max_tokens: ?i64 = null,
     temperature: f64 = 0,
@@ -141,7 +144,9 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
         limit = @min(limit, room);
     }
-    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+    // The prompt shows the published tools: a deferred definition is parsed and grammared but not rendered.
+    const shown_tools = input.published orelse input.tools;
+    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, shown_tools, rendered.ids, thinking, effort);
     var shared: std.ArrayList(u32) = .empty;
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
         if (cut >= 512) try shared.append(a, @intCast(cut));
@@ -165,7 +170,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk),
         // from the tokens alone, for every request: cached states are keyed by tokens
         .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids),
-        .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
+        .tools_json = if (shown_tools.len > 0) try json.stringify(a, .{ .array = @constCast(shown_tools) }, .{ .ascii = false }) else "",
         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
         .images = rendered.images,
         .cache_key = rendered.cache_key,

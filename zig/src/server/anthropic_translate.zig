@@ -14,6 +14,55 @@ fn string(cx: *Cx, value: ?Value, name: []const u8, empty: bool) errors.Refused!
     return v.string;
 }
 
+/// Anthropic's server-side tool search: the request ``type`` values this server runs itself.
+const Search = struct { kind: []const u8, name: []const u8, field: []const u8 };
+
+const searches = [_]Search{
+    .{ .kind = "tool_search_tool_regex_20251119", .name = "tool_search_tool_regex", .field = "pattern" },
+    .{ .kind = "tool_search_tool_bm25_20251119", .name = "tool_search_tool_bm25", .field = "query" },
+};
+
+fn toolSearch(kind: []const u8) ?Search {
+    for (searches) |s| if (std.mem.eql(u8, s.kind, kind)) return s;
+    return null;
+}
+
+/// A tool search entry as the function tool the model calls. Its searches run in the engine (never on the client), so
+/// the reply carries Anthropic's ``server_tool_use`` and ``tool_search_tool_result`` blocks and not a client tool call.
+fn searchTool(a: Allocator, cx: *Cx, tool: Value, search: Search) errors.Refused!Value {
+    const name = if (tool.get("name")) |n| try string(cx, n, "tool.name", false) else search.name;
+    const regex = std.mem.eql(u8, search.field, "pattern");
+    const arg = try a.dupe(u8, if (regex)
+        "A case-insensitive regular expression; tool names, descriptions, argument names and argument descriptions are searched."
+    else
+        "A natural-language query; tool names, descriptions, argument names and argument descriptions are searched.");
+    const arg_shape = try json.newObject(a);
+    try arg_shape.put(a, "type", .{ .string = "string" });
+    try arg_shape.put(a, "description", .{ .string = arg });
+    const limit_shape = try json.newObject(a);
+    try limit_shape.put(a, "type", .{ .string = "integer" });
+    try limit_shape.put(a, "description", .{ .string = "The most tools to return, 1 to 10000 (5 when omitted)." });
+    const props = try json.newObject(a);
+    try props.put(a, search.field, .{ .object = arg_shape });
+    try props.put(a, "limit", .{ .object = limit_shape });
+    const required = try a.alloc(Value, 1);
+    required[0] = .{ .string = search.field };
+    const schema = try json.newObject(a);
+    try schema.put(a, "type", .{ .string = "object" });
+    try schema.put(a, "properties", .{ .object = props });
+    try schema.put(a, "required", .{ .array = required });
+    const function = try json.newObject(a);
+    try function.put(a, "name", .{ .string = name });
+    try function.put(a, "parameters", .{ .object = schema });
+    try function.put(a, "description", .{ .string = "Search the tools this request deferred. Call it when the task needs a capability none of the tools you can see provide, then call a tool the search returns." });
+    const out = try json.newObject(a);
+    try out.put(a, "type", .{ .string = "function" });
+    try out.put(a, "function", .{ .object = function });
+    // the engine's own marker: this call is answered in the reply, not handed to the client
+    try out.put(a, "x_tensorfold_server_tool", .{ .string = search.kind });
+    return .{ .object = out };
+}
+
 fn parts(cx: *Cx, value: ?Value) errors.Refused![]const Value {
     const v = value orelse Value.null;
     if (v == .string) {
@@ -213,9 +262,21 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
     const tools = body.get("tools") orelse Value{ .array = &.{} };
     if (tools != .array) return cx.refuse("tools must be an array");
     var translated: std.ArrayList(Value) = .empty;
+    var deferred: usize = 0;
     for (tools.array) |tool| {
         const kind = if (tool == .object) tool.get("type") orelse Value{ .string = "custom" } else Value.null;
-        if (tool != .object or kind != .string or !std.mem.eql(u8, kind.string, "custom")) return cx.refuse("only client-defined function tools are supported");
+        if (tool != .object or kind != .string) return cx.refuse("only client-defined function tools and the tool search tools are supported");
+        if (toolSearch(kind.string)) |search| {
+            // the search runs here, so its own definition can never be the thing a search has to find
+            if (json.truthyField(tool, "defer_loading")) return cx.refuse("the tool search tool cannot be deferred");
+            try translated.append(a, try searchTool(a, cx, tool, search));
+            continue;
+        }
+        if (!std.mem.eql(u8, kind.string, "custom")) return cx.fail(.request, "unsupported tool type {s}", .{try pyrepr.repr(a, kind)});
+        // Anthropic deferred loading: the definition stays in the request so a search's references can be expanded,
+        // and out of the prompt's tool block until one is. The tool stays declared, so its calls still parse.
+        const is_deferred = json.truthyField(tool, "defer_loading");
+        if (is_deferred) deferred += 1;
         const name = try string(cx, tool.get("name"), "tool.name", false);
         const schema = tool.get("input_schema") orelse Value.null;
         if (schema != .object) return cx.refuse("tool.input_schema must be an object");
@@ -226,8 +287,11 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
         const t = try json.newObject(a);
         try t.put(a, "type", .{ .string = "function" });
         try t.put(a, "function", .{ .object = function });
+        if (is_deferred) try t.put(a, "defer_loading", .{ .bool = true });
         try translated.append(a, .{ .object = t });
     }
+    // Anthropic's 400: a search tool is the only way back, so something must be visible without one
+    if (deferred > 0 and deferred == translated.items.len) return cx.refuse("At least one tool must have defer_loading=false. All tools cannot be deferred.");
     if (translated.items.len > 0) try chat.put(a, "tools", .{ .array = translated.items });
     if (body.field("tool_choice")) |choice| {
         if (choice != .object) return cx.refuse("tool_choice must be an object");

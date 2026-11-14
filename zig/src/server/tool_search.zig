@@ -1,0 +1,371 @@
+//! Anthropic's tool search (``tool_search_tool_regex_20251119`` / ``tool_search_tool_bm25_20251119``): the search a
+//! deferred request's tools answer, and the reply blocks the contract defines for it. Pure functions over the
+//! request's own tool list, so a search costs nothing but a walk.
+const std = @import("std");
+const json = @import("json");
+const Allocator = std.mem.Allocator;
+const Value = json.Value;
+
+/// Which search tool the request offered: the regex variant takes a Python ``re.search`` pattern, the bm25 one a
+/// natural-language query. Both search names, descriptions, argument names and argument descriptions.
+pub const Variant = enum { regex, bm25 };
+
+/// Anthropic's default and bounds for ``limit``.
+pub const default_limit: usize = 5;
+pub const max_limit: usize = 10000;
+pub const max_pattern: usize = 200;
+pub const max_query: usize = 500;
+
+/// A search that could not run: the contract reports these in the result block with a 200, not as a request error.
+pub const Failure = struct { code: []const u8, message: []const u8 };
+
+/// What a search call produced: the tools it found (by name, best first), or why it did not run.
+pub const Outcome = union(enum) { found: []const []const u8, failed: Failure };
+
+/// ``invalid_tool_input``: the one code a malformed pattern or query reports.
+const bad_input = "invalid_tool_input";
+
+fn fail(code: []const u8, message: []const u8) Outcome {
+    return .{ .failed = .{ .code = code, .message = message } };
+}
+
+const Limit = union(enum) { ok: usize, bad: Failure };
+
+/// The search a call's arguments ask for: ``limit`` is 1 to 10000, ``5`` when absent.
+fn limitOf(args: Value) Limit {
+    const raw = if (args == .object) args.get("limit") else null;
+    const v = raw orelse return .{ .ok = default_limit };
+    if (v == .null) return .{ .ok = default_limit };
+    const n = v.int64() orelse return .{ .bad = .{ .code = bad_input, .message = "limit must be an integer" } };
+    if (n < 1 or n > max_limit) return .{ .bad = .{ .code = bad_input, .message = "limit must be between 1 and 10000" } };
+    return .{ .ok = @intCast(n) };
+}
+
+/// Runs ``args`` (``{pattern|query, limit}``) against ``tools``, as the request declared them.
+pub fn run(a: Allocator, tools: []const Value, variant: Variant, args: Value) Allocator.Error!Outcome {
+    const limit = switch (limitOf(args)) {
+        .ok => |n| n,
+        .bad => |f| return .{ .failed = f },
+    };
+    const leaf = switch (variant) {
+        .regex => "pattern",
+        .bm25 => "query",
+    };
+    const text = blk: {
+        const v = if (args == .object) args.get(leaf) else null;
+        const s = v orelse return fail(bad_input, "the search input must include its query");
+        if (s != .string or s.string.len == 0) return fail(bad_input, "the search input must be a non-empty string");
+        break :blk s.string;
+    };
+    return switch (variant) {
+        .regex => regex(a, tools, text, limit),
+        .bm25 => bm25(a, tools, text, limit),
+    };
+}
+
+/// The text a tool is searched by: its name, description, and every argument's name and description.
+fn fields(a: Allocator, tool: Value) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
+    if (function.get("name")) |n| {
+        if (n == .string) try out.appendSlice(a, n.string);
+    }
+    if (function.get("description")) |d| {
+        if (d == .string) {
+            try out.append(a, ' ');
+            try out.appendSlice(a, d.string);
+        }
+    }
+    if (function.get("parameters")) |p| {
+        if (p == .object) {
+            if (p.get("properties")) |props| {
+                if (props == .object) {
+                    var it = props.object.iterator();
+                    while (it.next()) |entry| {
+                        try out.append(a, ' ');
+                        try out.appendSlice(a, entry.key_ptr.*);
+                        if (entry.value_ptr.* == .object) {
+                            if (entry.value_ptr.get("description")) |d| {
+                                if (d == .string) {
+                                    try out.append(a, ' ');
+                                    try out.appendSlice(a, d.string);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out.items;
+}
+
+fn nameOf(tool: Value) []const u8 {
+    const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
+    const n = function.get("name") orelse return "";
+    return if (n == .string) n.string else "";
+}
+
+/// ---------------------------------------------------------------------------------------------------------------
+/// BM25: the natural-language variant. Tokens are runs of alphanumerics with ``_`` and ``-`` as separators, so
+/// ``get_weather`` is found by ``weather``; the whole name is searched too.
+/// ---------------------------------------------------------------------------------------------------------------
+
+const Hits = struct { name: []const u8, score: f64 };
+
+fn tokens(a: Allocator, text: []const u8) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var start: ?usize = null;
+    for (text, 0..) |ch, i| {
+        const word = std.ascii.isAlphanumeric(ch);
+        if (word and start == null) start = i;
+        if (!word and start != null) {
+            try out.append(a, try std.ascii.allocLowerString(a, text[start.?..i]));
+            start = null;
+        }
+    }
+    if (start) |s| try out.append(a, try std.ascii.allocLowerString(a, text[s..]));
+    return out.items;
+}
+
+fn count(haystack: []const []const u8, needle: []const u8) f64 {
+    var n: f64 = 0;
+    for (haystack) |t| if (std.mem.eql(u8, t, needle)) {
+        n += 1;
+    };
+    return n;
+}
+
+fn bm25(a: Allocator, tools: []const Value, query: []const u8, limit: usize) Allocator.Error!Outcome {
+    if (query.len > max_query) return fail(bad_input, "query must be at most 500 characters");
+    const terms = try tokens(a, query);
+    if (terms.len == 0) return .{ .found = &.{} };
+
+    // one token list per tool, and the average length BM25 normalises by
+    const counts = try a.alloc([]const []const u8, tools.len);
+    var total: f64 = 0;
+    for (tools, counts) |tool, *slot| {
+        slot.* = try tokens(a, try fields(a, tool));
+        total += @floatFromInt(slot.len);
+    }
+    const average = if (tools.len == 0) 0 else total / @as(f64, @floatFromInt(tools.len));
+
+    var hits: std.ArrayList(Hits) = .empty;
+    const k1: f64 = 1.2;
+    const b: f64 = 0.75;
+    for (tools, counts) |tool, doc| {
+        if (doc.len == 0) continue;
+        var score: f64 = 0;
+        for (terms) |term| {
+            const tf = count(doc, term);
+            if (tf == 0) continue;
+            var df: f64 = 0;
+            for (counts) |other| {
+                if (count(other, term) > 0) df += 1;
+            }
+            const idf = std.math.log1p((@as(f64, @floatFromInt(tools.len)) - df + 0.5) / (df + 0.5));
+            const len = @as(f64, @floatFromInt(doc.len));
+            score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * len / average));
+        }
+        if (score > 0) try hits.append(a, .{ .name = nameOf(tool), .score = score });
+    }
+    return .{ .found = try rank(a, hits, limit) };
+}
+
+/// The best ``limit`` hits, ties broken by name so a search is deterministic.
+fn rank(a: Allocator, hits: std.ArrayList(Hits), limit: usize) Allocator.Error![]const []const u8 {
+    const less = struct {
+        fn before(_: void, x: Hits, y: Hits) bool {
+            if (x.score != y.score) return x.score > y.score;
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.before;
+    std.mem.sort(Hits, hits.items, {}, less);
+    const n = @min(limit, hits.items.len);
+    const out = try a.alloc([]const u8, n);
+    for (hits.items[0..n], out) |hit, *slot| slot.* = hit.name;
+    return out;
+}
+
+/// ---------------------------------------------------------------------------------------------------------------
+/// The regex variant: ``re.search`` semantics, case-insensitive, over the same fields. Supported: literals, ``.``,
+/// ``*``, ``+``, ``?``, ``[...]`` classes (ranges and ``^``), ``^``/``$`` anchors, ``|`` alternation and ``\``
+/// escapes. Constructs Python has and this does not (groups, backreferences, ``{m,n}``, lookaround, ``\b``) are
+/// reported as ``invalid_tool_input`` rather than silently matching something else.
+/// ---------------------------------------------------------------------------------------------------------------
+
+fn regex(a: Allocator, tools: []const Value, pattern: []const u8, limit: usize) Allocator.Error!Outcome {
+    if (pattern.len > max_pattern) return fail(bad_input, "pattern must be at most 200 characters");
+    if (!supported(pattern)) return fail(bad_input, "the pattern uses a construct this search does not support: use literals, ., *, +, ?, [...], ^, $ and |");
+    var hits: std.ArrayList(Hits) = .empty;
+    for (tools) |tool| {
+        const text = try fields(a, tool);
+        if (matches(pattern, text)) try hits.append(a, .{ .name = nameOf(tool), .score = 1 });
+    }
+    return .{ .found = try rank(a, hits, limit) };
+}
+
+/// False when the pattern uses something this matcher does not implement.
+fn supported(pattern: []const u8) bool {
+    var i: usize = 0;
+    while (i < pattern.len) : (i += 1) switch (pattern[i]) {
+        '\\' => {
+            i += 1;
+            if (i == pattern.len) return false;
+            // escapes are literals; the classes Python spells with one (\d, \w, \b) are not implemented
+            if (std.ascii.isAlphanumeric(pattern[i])) return false;
+        },
+        '(', ')', '{', '}' => return false,
+        else => {},
+    };
+    return true;
+}
+
+fn lower(ch: u8) u8 {
+    return std.ascii.toLower(ch);
+}
+
+fn atomLen(pattern: []const u8, at: usize) usize {
+    return switch (pattern[at]) {
+        '\\' => 2,
+        '[' => blk: {
+            var i = at + 1;
+            if (i < pattern.len and pattern[i] == '^') i += 1;
+            if (i < pattern.len and pattern[i] == ']') i += 1; // a leading ] is a member
+            while (i < pattern.len and pattern[i] != ']') i += 1;
+            break :blk @min(i + 1, pattern.len) - at;
+        },
+        else => 1,
+    };
+}
+
+fn atomMatches(pattern: []const u8, at: usize, ch: u8) bool {
+    return switch (pattern[at]) {
+        '.' => true,
+        '\\' => at + 1 < pattern.len and lower(pattern[at + 1]) == lower(ch),
+        '[' => blk: {
+            var i = at + 1;
+            var negated = false;
+            if (i < pattern.len and pattern[i] == '^') {
+                negated = true;
+                i += 1;
+            }
+            var hit = false;
+            while (i < pattern.len and pattern[i] != ']') {
+                if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
+                    if (lower(ch) >= lower(pattern[i]) and lower(ch) <= lower(pattern[i + 2])) hit = true;
+                    i += 3;
+                } else {
+                    if (lower(pattern[i]) == lower(ch)) hit = true;
+                    i += 1;
+                }
+            }
+            break :blk hit != negated;
+        },
+        else => lower(pattern[at]) == lower(ch),
+    };
+}
+
+/// ``re.search``: an unanchored match somewhere in ``text``, or one at its start after ``^``.
+fn matches(pattern: []const u8, text: []const u8) bool {
+    var rest = pattern;
+    while (rest.len > 0) {
+        const cut = std.mem.indexOfScalar(u8, rest, '|') orelse rest.len;
+        if (alternative(rest[0..cut], text)) return true;
+        rest = if (cut == rest.len) "" else rest[cut + 1 ..];
+    }
+    return false;
+}
+
+fn alternative(pattern: []const u8, text: []const u8) bool {
+    if (pattern.len == 0) return true;
+    if (pattern[0] == '^') {
+        var i: usize = 1;
+        while (i < pattern.len and pattern[i] == '^') i += 1;
+        return from(pattern, i, text, 0);
+    }
+    var start: usize = 0;
+    while (start <= text.len) : (start += 1) if (from(pattern, 0, text, start)) return true;
+    return false;
+}
+
+fn from(pattern: []const u8, at: usize, text: []const u8, ti: usize) bool {
+    if (at == pattern.len) return true; // `re.search` needs no end anchor
+    if (pattern[at] == '$' and at + 1 == pattern.len) return ti == text.len;
+    const end = at + atomLen(pattern, at);
+    const quant = if (end < pattern.len) pattern[end] else 0;
+    switch (quant) {
+        '*' => {
+            var k = ti;
+            while (true) {
+                if (from(pattern, end + 1, text, k)) return true;
+                if (k >= text.len or !atomMatches(pattern, at, text[k])) return false;
+                k += 1;
+            }
+        },
+        '+' => {
+            if (ti >= text.len or !atomMatches(pattern, at, text[ti])) return false;
+            var k = ti + 1;
+            while (true) {
+                if (from(pattern, end + 1, text, k)) return true;
+                if (k >= text.len or !atomMatches(pattern, at, text[k])) return false;
+                k += 1;
+            }
+        },
+        '?' => {
+            if (ti < text.len and atomMatches(pattern, at, text[ti]) and from(pattern, end + 1, text, ti + 1)) return true;
+            return from(pattern, end + 1, text, ti);
+        },
+        else => {
+            if (ti >= text.len or !atomMatches(pattern, at, text[ti])) return false;
+            return from(pattern, end, text, ti + 1);
+        },
+    }
+}
+
+/// ---------------------------------------------------------------------------------------------------------------
+/// The reply blocks the contract defines. A search the engine ran reports itself as ``server_tool_use`` and its
+/// references as ``tool_search_tool_result``; the client must echo both back and never answer them.
+/// ---------------------------------------------------------------------------------------------------------------
+
+/// ``{type: "server_tool_use", id, name, input}``: the engine's own call, never the client's.
+pub fn serverToolUse(a: Allocator, id: []const u8, name: []const u8, input: Value) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    try o.put(a, "type", .{ .string = "server_tool_use" });
+    try o.put(a, "id", .{ .string = id });
+    try o.put(a, "name", .{ .string = name });
+    try o.put(a, "input", input);
+    return .{ .object = o };
+}
+
+/// ``{type: "tool_search_tool_result", tool_use_id, content:{type, tool_references}}`` for a search that ran.
+pub fn result(a: Allocator, tool_use_id: []const u8, names: []const []const u8) Allocator.Error!Value {
+    const refs = try a.alloc(Value, names.len);
+    for (names, refs) |name, *slot| {
+        const ref = try json.newObject(a);
+        try ref.put(a, "type", .{ .string = "tool_reference" });
+        try ref.put(a, "tool_name", .{ .string = name });
+        slot.* = .{ .object = ref };
+    }
+    const content = try json.newObject(a);
+    try content.put(a, "type", .{ .string = "tool_search_tool_search_result" });
+    try content.put(a, "tool_references", .{ .array = refs });
+    return resultBlock(a, tool_use_id, .{ .object = content });
+}
+
+/// The same block for a search that could not run: a 200 with the contract's ``error_code`` and message.
+pub fn failure(a: Allocator, tool_use_id: []const u8, why: Failure) Allocator.Error!Value {
+    const content = try json.newObject(a);
+    try content.put(a, "type", .{ .string = "tool_search_tool_result_error" });
+    try content.put(a, "error_code", .{ .string = why.code });
+    try content.put(a, "error_message", .{ .string = why.message });
+    return resultBlock(a, tool_use_id, .{ .object = content });
+}
+
+fn resultBlock(a: Allocator, tool_use_id: []const u8, content: Value) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    try o.put(a, "type", .{ .string = "tool_search_tool_result" });
+    try o.put(a, "tool_use_id", .{ .string = tool_use_id });
+    try o.put(a, "content", content);
+    return .{ .object = o };
+}
