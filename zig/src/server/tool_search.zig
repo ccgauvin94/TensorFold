@@ -369,3 +369,80 @@ fn resultBlock(a: Allocator, tool_use_id: []const u8, content: Value) Allocator.
     try o.put(a, "content", content);
     return .{ .object = o };
 }
+
+/// ---------------------------------------------------------------------------------------------------------------
+/// Expansion: the definitions a search's references stand for, as the text a mid-conversation system message
+/// carries. Anthropic appends a ``tool_reference`` inline and expands it before the model sees it; here the
+/// expansion is text, and it must be BYTE-IDENTICAL every time the same references come back — a later request
+/// re-derives it from the result blocks in the conversation, and a single differing byte would move the prompt and
+/// cost the whole prefix cache.
+/// ---------------------------------------------------------------------------------------------------------------
+
+/// The tool a reference names, as the request declared it.
+fn definition(tools: []const Value, name: []const u8) ?Value {
+    for (tools) |tool| if (std.mem.eql(u8, nameOf(tool), name)) return tool;
+    return null;
+}
+
+/// The first reference the request holds no definition for: the contract's 400 (``Tool reference '<name>' not
+/// found in available tools``), which is a client error rather than a failed search.
+pub fn missing(tools: []const Value, names: []const []const u8) ?[]const u8 {
+    for (names) |name| if (definition(tools, name) == null) return name;
+    return null;
+}
+
+/// ``## Tool: <name>`` sections for ``names``, in the order the search returned them, each with its description
+/// and its parameters as JSON Schema — the same shape the encoder already gives this family for a
+/// ``## Response Format`` section, so the model reads it as a definition rather than as conversation.
+pub fn expansion(a: Allocator, tools: []const Value, names: []const []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (names) |name| {
+        const tool = definition(tools, name) orelse continue;
+        const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
+        try out.appendSlice(a, "## Tool: ");
+        try out.appendSlice(a, name);
+        try out.append(a, '\n');
+        if (function.get("description")) |d| {
+            if (d == .string and d.string.len > 0) {
+                try out.appendSlice(a, d.string);
+                try out.append(a, '\n');
+            }
+        }
+        if (function.get("parameters")) |p| {
+            try out.appendSlice(a, "Parameters (JSON Schema): ");
+            try out.appendSlice(a, try json.stringify(a, p, .{ .ascii = false, .compact = true })); // tight: fewer tokens, and stable
+            try out.append(a, '\n');
+        }
+    }
+    return out.items;
+}
+
+/// The whole system message a search leaves in the conversation: what was searched, what it found, and the
+/// definitions. A search that found nothing still says so — the model must not think it hit an error.
+pub fn expansionMessage(a: Allocator, role: []const u8, leaf: []const u8, query: []const u8, names: []const []const u8, tools: []const Value) Allocator.Error!Value {
+    var text: std.ArrayList(u8) = .empty;
+    if (names.len == 0) {
+        try text.appendSlice(a, "Tool search (");
+        try text.appendSlice(a, leaf);
+        try text.appendSlice(a, " \"");
+        try text.appendSlice(a, query);
+        try text.appendSlice(a, "\") found no tools. Nothing was changed; use the tools you can already see.");
+    } else {
+        try text.appendSlice(a, "Tool search (");
+        try text.appendSlice(a, leaf);
+        try text.appendSlice(a, " \"");
+        try text.appendSlice(a, query);
+        try text.appendSlice(a, "\") added ");
+        try text.appendSlice(a, try std.fmt.allocPrint(a, "{d} tool{s}: ", .{ names.len, if (names.len == 1) "" else "s" }));
+        for (names, 0..) |name, i| {
+            if (i > 0) try text.appendSlice(a, ", ");
+            try text.appendSlice(a, name);
+        }
+        try text.appendSlice(a, ".\n\n");
+        try text.appendSlice(a, try expansion(a, tools, names));
+    }
+    const o = try json.newObject(a);
+    try o.put(a, "role", .{ .string = role });
+    try o.put(a, "content", .{ .string = text.items });
+    return .{ .object = o };
+}

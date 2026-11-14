@@ -146,3 +146,55 @@ test "the reply blocks carry the contract's shapes" {
     try std.testing.expectEqualStrings("tool_search_tool_result_error", body.get("type").?.string);
     try std.testing.expectEqualStrings("invalid_tool_input", body.get("error_code").?.string);
 }
+
+test "the expansion renders the definitions, in order, byte-identically" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = try tools(a);
+
+    const names_in = [_][]const u8{ "get_weather_data", "get_weather" };
+    const one = try search.expansion(a, list, &names_in);
+    try std.testing.expect(std.mem.indexOf(u8, one, "## Tool: get_weather_data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "Hourly weather history") != null);
+    // the schema is rendered as JSON, in the order the request declared its fields
+    try std.testing.expect(std.mem.indexOf(u8, one, "Parameters (JSON Schema): {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"type\":\"object\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"station\"") != null);
+    // the order the search returned them, not the request's order
+    const data_at = std.mem.indexOf(u8, one, "## Tool: get_weather_data").?;
+    const weather_at = std.mem.indexOf(u8, one, "## Tool: get_weather\n").?;
+    try std.testing.expect(data_at < weather_at);
+
+    // a later request re-derives this from the result blocks: a single differing byte would cost the prefix cache
+    const two = try search.expansion(a, list, &names_in);
+    try std.testing.expectEqualStrings(one, two);
+
+    // a reference with no definition is the contract's client error, not a silent skip
+    const ghost = [_][]const u8{ "get_weather", "no_such_tool" };
+    try std.testing.expectEqualStrings("no_such_tool", search.missing(list, &ghost).?);
+    try std.testing.expect(search.missing(list, &names_in) == null);
+}
+
+test "the expansion message carries the search and its definitions" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = try tools(a);
+
+    const found_names = [_][]const u8{"get_weather"};
+    const found = try search.expansionMessage(a, "system", "pattern", "weather", &found_names, list);
+    try std.testing.expectEqualStrings("system", found.get("role").?.string);
+    const text = found.get("content").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "Tool search (pattern \"weather\") added 1 tool: get_weather.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Tool: get_weather") != null);
+
+    // nothing found says so, so the model does not read it as a failure
+    const none = try search.expansionMessage(a, "system", "pattern", "quantum", &.{}, list);
+    const none_text = none.get("content").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, none_text, "found no tools") != null);
+
+    // and it is re-derivable: the same conversation renders the same message
+    const again = try search.expansionMessage(a, "system", "pattern", "weather", &found_names, list);
+    try std.testing.expectEqualStrings(text, again.get("content").?.string);
+}
