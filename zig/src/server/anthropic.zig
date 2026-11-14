@@ -142,6 +142,9 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
 }
 
 
+/// A search call the model made in a round: the id it gave, the tool it named, and its inputs.
+const SearchCall = struct { id: Value, name: []const u8, input: Value };
+
 /// How many searches one reply may make before it must answer (`--tool-search`): enough for a couple of hops, few
 /// enough that a model that keeps searching cannot spin.
 const max_search_rounds = 4;
@@ -168,7 +171,7 @@ fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), 
     const calls = message.get("tool_calls") orelse return false;
     if (calls != .array or calls.array.len == 0) return false;
 
-    var call: ?tool_search.SearchCall = null;
+    var call: ?SearchCall = null;
     for (calls.array) |entry| {
         const function = entry.get("function") orelse continue;
         if (function != .object) continue;
