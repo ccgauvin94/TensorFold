@@ -310,3 +310,34 @@ test "the gate sees what a request asks for and nothing else" {
     try std.testing.expect(search.requested(try args(a, "{}")) == null);
     try std.testing.expect(search.requested(try args(a, "{\"tools\":[]}")) == null);
 }
+
+test "a search that opens the assistant turn still has a turn to fold the call into" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // the shape a live model produced: the search is the turn's first block, with no prose before it
+    const body = try args(a,
+        \\{"model":"m","max_tokens":64,
+        \\ "tools":[{"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"},
+        \\          {"name":"get_weather","description":"Weather","input_schema":{"type":"object"},"defer_loading":true}],
+        \\ "messages":[{"role":"user","content":"weather in Bozeman?"},
+        \\  {"role":"assistant","content":[
+        \\    {"type":"server_tool_use","id":"srvtoolu_1","name":"tool_search_tool_regex","input":{"pattern":"get_weather"}},
+        \\    {"type":"tool_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}},
+        \\    {"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"location":"Bozeman"}}]}]}
+    );
+
+    var cx: errors.Cx = .{ .a = a };
+    const chat = try translate(&cx, body, false);
+    const declared = try tool_specs.active(&cx, chat.get("tools"), null);
+    const resolved = try search.resolve(a, &cx, chat.get("messages").?, "system", declared);
+
+    const msgs = resolved.array;
+    try std.testing.expectEqual(@as(usize, 4), msgs.len);
+    // a turn with only the call line, which is what the live request wrote too
+    try std.testing.expectEqualStrings("assistant", msgs[1].get("role").?.string);
+    try std.testing.expectEqualStrings("Tool search: pattern=\"get_weather\"", msgs[1].get("content").?.array[0].get("text").?.string);
+    try std.testing.expectEqualStrings("system", msgs[2].get("role").?.string);
+    try std.testing.expectEqualStrings("get_weather", msgs[3].get("tool_calls").?.array[0].get("function").?.get("name").?.string);
+}

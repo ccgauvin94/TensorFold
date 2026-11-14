@@ -182,18 +182,18 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
                 // prompt carries its inputs as a canonical line. The assistant turn is cut here and a placeholder
                 // marks where the expansion goes once the request's tools are known (tool_search.resolve).
                 if (search_at != null) return cx.refuse("a tool search call must be followed by its result before another");
-                if (content.items.len > 0 or calls.items.len > 0 or any_thought) {
-                    const item = try json.newObject(a);
-                    try item.put(a, "role", .{ .string = role });
-                    try item.put(a, "content", if (content.items.len > 0) .{ .array = content.items } else .{ .string = "" });
-                    if (calls.items.len > 0) try item.put(a, "tool_calls", .{ .array = calls.items });
-                    if (any_thought) try item.put(a, "reasoning_content", .{ .string = thoughts.items });
-                    try out.append(a, .{ .object = item });
-                    content = .empty;
-                    calls = .empty;
-                    thoughts = .empty;
-                    any_thought = false;
-                }
+                // The turn is emitted even when the model wrote no prose before the search: the canonical call
+                // line is folded into it, so there has to be a turn to fold it into.
+                const item = try json.newObject(a);
+                try item.put(a, "role", .{ .string = role });
+                try item.put(a, "content", if (content.items.len > 0) .{ .array = content.items } else .{ .string = "" });
+                if (calls.items.len > 0) try item.put(a, "tool_calls", .{ .array = calls.items });
+                if (any_thought) try item.put(a, "reasoning_content", .{ .string = thoughts.items });
+                try out.append(a, .{ .object = item });
+                content = .empty;
+                calls = .empty;
+                thoughts = .empty;
+                any_thought = false;
                 const input = block.get("input") orelse Value.null;
                 if (input != .object) return cx.refuse("server_tool_use.input must be an object");
                 const marker = try json.newObject(a);
