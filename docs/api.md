@@ -787,8 +787,36 @@ That install is the Python 0.6.6 engine's; the native server uses `libtfgrammar`
 Usage separates uncached `input_tokens` from `cache_read_input_tokens` and reports `output_tokens_details.thinking_tokens`
 when the backend counts them. Prefix caching remains automatic,
 so `cache_control` hints do not allocate an Anthropic cache or report cache-creation tokens. Errors use the
-Anthropic error envelope, including after an SSE stream opens. Server-side tools, documents/file IDs,
+Anthropic error envelope, including after an SSE stream opens. Documents/file IDs,
 redacted thinking and other context edits return HTTP 400.
+
+### Deferred tool loading
+
+`--tool-search` (off by default) accepts Anthropic's tool search: the request carries every definition and marks the
+ones the model should not see yet with `defer_loading: true`, plus one search tool, `tool_search_tool_regex_20251119`
+(a Python `re.search` pattern) or `tool_search_tool_bm25_20251119` (a natural-language query, at most 500
+characters). A server without the flag answers HTTP 400 for either, so an older server never quietly loads every
+definition into the prompt.
+
+Declared and published are different lists. A deferred tool stays declared — its calls parse, and the grammar is
+built from the full list, as Anthropic specifies — and leaves the prompt's tool block, so the head of the prompt is
+stable across a session and an unchanged tool set stays in the prefix cache. `count_tokens` counts the published
+list, so the count and the prompt agree.
+
+A search runs in the engine, not in the client. Its matches are rendered as a mid-conversation system message (or a
+user message, whichever the template keeps) that names the search, lists the tools it found and appends each
+definition as a `## Tool: <name>` section with its JSON Schema, so the head never moves. The regex subset is
+literals, `.`, `*`, `+`, `?`, `[...]`, `^`, `$`, `|` and `\` escapes; groups, `{m,n}`, `\d`/`\w`/`\b` and
+lookaround report `invalid_tool_input` rather than matching something else. Both variants search tool names,
+descriptions, argument names and argument descriptions, honour `limit` (1 to 10000, default 5), and report a search
+that found nothing as an empty reference list rather than an error.
+
+A replayed conversation may echo `server_tool_use` and `tool_search_tool_result` blocks. They are folded back into
+the turns the live request wrote — a canonical call line in the assistant turn, the expansion message after it —
+derived from the call's `input` and the result's `tool_references` alone. Nothing from the model's own markup and no
+call id reaches the prompt, so a replay renders the same tokens and hits the same prefix. A reference with no
+definition in the request is HTTP 400 (`Tool reference '<name>' not found in available tools`), and a search that
+could not run is reported in the reply, not as a request error.
 
 Connect Claude Code using the ID from `/v1/models`:
 

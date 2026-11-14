@@ -77,6 +77,12 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             .ok => |v| v,
             .err => |m| return sendError(conn, a, m, 400),
         };
+        // deferred loading is opt-in: without the flag this server answers what it always did, and says so rather
+        // than quietly loading every deferred definition into the prompt
+        if (!srv.config.tool_search) if (tool_search.requested(body)) |what| {
+            const message = std.fmt.allocPrint(a, "{s} is not enabled on this server (--tool-search)", .{what}) catch return;
+            return sendError(conn, a, message, 400);
+        };
         const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
         // Anthropic deferred loading: a replayed search carries its blocks as placeholders until the request's own
         // tools can expand them, and the expansion must sit where the live request put it or the prefix moves.

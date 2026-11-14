@@ -291,3 +291,22 @@ test "a replayed assistant turn is cut at the search, as the live request wrote 
     // the tool result still ends the conversation as a tool turn
     try std.testing.expectEqualStrings("tool", msgs[4].get("role").?.string);
 }
+
+test "the gate sees what a request asks for and nothing else" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const plain = try args(a, "{\"tools\":[{\"name\":\"get_weather\",\"input_schema\":{\"type\":\"object\"}}]}");
+    try std.testing.expect(search.requested(plain) == null);
+
+    const deferred = try args(a, "{\"tools\":[{\"name\":\"get_weather\",\"input_schema\":{\"type\":\"object\"},\"defer_loading\":true}]}");
+    try std.testing.expectEqualStrings("defer_loading", search.requested(deferred).?);
+
+    const searching = try args(a, "{\"tools\":[{\"type\":\"tool_search_tool_bm25_20251119\"}]}");
+    try std.testing.expectEqualStrings("the tool search tool", search.requested(searching).?);
+
+    // a request with no tools at all is not asking for anything
+    try std.testing.expect(search.requested(try args(a, "{}")) == null);
+    try std.testing.expect(search.requested(try args(a, "{\"tools\":[]}")) == null);
+}

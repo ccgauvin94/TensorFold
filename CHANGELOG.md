@@ -4,6 +4,14 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Anthropic Messages: deferred tool loading behind `--tool-search` (off by default). A request may carry
+  `tool_search_tool_regex_20251119` or `tool_search_tool_bm25_20251119` and mark definitions `defer_loading: true`;
+  the engine searches the request's own tool list and expands the matches into a mid-conversation message, so the
+  prompt's tool block stays stable and the prefix cache survives discovery. Deferred tools stay declared, so their
+  calls parse. A replayed `server_tool_use`/`tool_search_tool_result` pair is folded back into the turns the live
+  request wrote, from the call's inputs and the result's references alone. Off, the routes answer the requests they
+  always did and refuse the new ones rather than loading every definition. See [docs/api.md](docs/api.md).
+
 - Kolibri-1 on CUDA, and Drama 3 with prompt chunks of more than one row (`TF_DRAMA_PREFILL_ROWS`): the block-FP8 routed experts' prompt kernels copy their weights into shared memory in stored order, so each 32-byte sector is read from L2 once instead of twice (#1460). The matrix multiplies read the same values in the same order, so outputs are the same bytes. On a GB10, Kolibri-1's prompts ran 13% faster at 2k tokens and 3 to 4% faster from 8k to 64k, with the same tokens. The kernel contract now records the register and shared-memory limits of Kolibri-1's three prompt launches. Thanks to @jschmied.
 
 - Qwen3.8-27B on Metal: `TF_Q27_PROFILE=N` logs each kernel class's GPU time, the DFlash2 drafter's included, every N decode rounds (`1` means every 64), and adds `gpu_seconds` to replies: the GPU time of the forward passes the reply ran in, with a round shared by several replies counted in each (#1215). It is a diagnostic and off by default: without it replies are byte-identical to before, and a value it cannot read leaves it off with a warning. Timing every round is slow: on an M5 Ultra one stream decodes at about a ninth of its usual rate with it on, so use it to diagnose, not to serve. Thanks to @grantoverton.

@@ -64,6 +64,8 @@ pub const Config = struct {
     /// Seconds of idle past the last request before the engine closes; the next request reloads it (0: never).
     idle_unload_s: i64 = 0,
     dashboard: bool = false,
+    /// --tool-search: /v1/messages accepts Anthropic's tool search tools and defer_loading.
+    tool_search: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
     use_drafts: bool = true,

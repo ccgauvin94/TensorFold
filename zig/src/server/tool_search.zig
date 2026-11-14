@@ -591,3 +591,23 @@ fn plainMessage(a: Allocator, role: []const u8, text: []const u8) Allocator.Erro
     try o.put(a, "content", .{ .string = text });
     return .{ .object = o };
 }
+
+/// What a request asks for that ``--tool-search`` gates: a search tool entry, or any ``defer_loading``. Null for
+/// every request that knows nothing about the feature, which is what keeps an ungated server's behaviour identical.
+pub fn requested(body: Value) ?[]const u8 {
+    if (body != .object) return null;
+    const tools = body.get("tools") orelse return null;
+    if (tools != .array) return null;
+    var deferred = false;
+    for (tools.array) |tool| {
+        if (tool != .object) continue;
+        if (tool.strField("type")) |kind| {
+            for (searches_types) |wanted| if (std.mem.eql(u8, kind, wanted)) return "the tool search tool";
+        }
+        if (json.truthyField(tool, "defer_loading")) deferred = true;
+    }
+    return if (deferred) "defer_loading" else null;
+}
+
+/// The two request types the tool search tools are declared with.
+const searches_types = [_][]const u8{ "tool_search_tool_regex_20251119", "tool_search_tool_bm25_20251119" };

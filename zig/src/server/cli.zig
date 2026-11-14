@@ -55,6 +55,7 @@ pub const flags = [_]Flag{
     .{ .name = "--api-key-file", .native = true },
     .{ .name = "--metrics-open", .kind = .store_true, .native = true },
     .{ .name = "--dashboard", .kind = .store_true, .native = true },
+    .{ .name = "--tool-search", .kind = .store_true, .native = true },
     .{ .name = "--vision", .kind = .store_true, .native = true },
     .{ .name = "--vision-urls", .kind = .store_true, .native = true },
     .{ .name = "--vision-offload", .kind = .store_true },
@@ -177,6 +178,8 @@ pub const Args = struct {
     api_key_file: ?[]const u8 = null,
     metrics_open: bool = false,
     dashboard: bool = false,
+    /// Anthropic deferred tool loading: the tool search tools and defer_loading on /v1/messages.
+    tool_search: bool = false,
     context: ?i64 = null,
     max_frames: ?u32 = null,
     silence: api.speech_guard.Config = .{},
@@ -409,7 +412,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
         out.port = @intCast(p);
-    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try repeated.alias.append(a, v) else if (is(name, "--name-priority")) try repeated.priorities.append(a, v) else if (is(name, "--api-key")) try repeated.keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
+    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try repeated.alias.append(a, v) else if (is(name, "--name-priority")) try repeated.priorities.append(a, v) else if (is(name, "--api-key")) try repeated.keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--tool-search")) out.tool_search = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
         out.learn = true;
         out.learn_dir = v;
     } else if (is(name, "--learn-min-free-gib")) {
