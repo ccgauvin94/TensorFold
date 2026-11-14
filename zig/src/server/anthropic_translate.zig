@@ -4,6 +4,7 @@ const json = @import("json");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const pyrepr = @import("pyrepr.zig");
+const tool_search = @import("tool_search.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -145,6 +146,9 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
         var calls: std.ArrayList(Value) = .empty;
         var thoughts: std.ArrayList(u8) = .empty;
         var any_thought = false;
+        // Anthropic deferred loading: the search blocks are cut out of the assistant turn, and a placeholder marks
+        // where the expansion belongs (tool_search.resolve fills it in once the request's tools are known).
+        var search_at: ?usize = null;
         const blocks = try parts(cx, message.get("content"));
         for (blocks) |block| {
             const kind = block.get("type");
@@ -173,6 +177,45 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
                 try call.put(a, "type", .{ .string = "function" });
                 try call.put(a, "function", .{ .object = function });
                 try calls.append(a, .{ .object = call });
+            } else if (std.mem.eql(u8, k, "server_tool_use") and assistant) {
+                // Anthropic deferred loading: the engine ran this call, so it never reaches the client and the
+                // prompt carries its inputs as a canonical line. The assistant turn is cut here and a placeholder
+                // marks where the expansion goes once the request's tools are known (tool_search.resolve).
+                if (search_at != null) return cx.refuse("a tool search call must be followed by its result before another");
+                if (content.items.len > 0 or calls.items.len > 0 or any_thought) {
+                    const item = try json.newObject(a);
+                    try item.put(a, "role", .{ .string = role });
+                    try item.put(a, "content", if (content.items.len > 0) .{ .array = content.items } else .{ .string = "" });
+                    if (calls.items.len > 0) try item.put(a, "tool_calls", .{ .array = calls.items });
+                    if (any_thought) try item.put(a, "reasoning_content", .{ .string = thoughts.items });
+                    try out.append(a, .{ .object = item });
+                    content = .empty;
+                    calls = .empty;
+                    thoughts = .empty;
+                    any_thought = false;
+                }
+                const input = block.get("input") orelse Value.null;
+                if (input != .object) return cx.refuse("server_tool_use.input must be an object");
+                const marker = try json.newObject(a);
+                try marker.put(a, "role", .{ .string = tool_search.placeholder });
+                try marker.put(a, "input", input);
+                search_at = out.items.len;
+                try out.append(a, .{ .object = marker });
+            } else if (std.mem.eql(u8, k, "tool_search_tool_result") and assistant) {
+                const at = search_at orelse return cx.refuse("a tool search result must follow its call");
+                const marker = &out.items[at];
+                const content_ = block.get("content") orelse Value.null;
+                if (content_ != .object) return cx.refuse("tool_search_tool_result.content must be an object");
+                const result_kind = content_.strField("type") orelse return cx.refuse("tool_search_tool_result.content must carry its type");
+                if (std.mem.eql(u8, result_kind, "tool_search_tool_result_error")) {
+                    try marker.object.put(a, "error_code", content_.get("error_code") orelse Value.null);
+                    try marker.object.put(a, "error_message", content_.get("error_message") orelse Value.null);
+                } else if (std.mem.eql(u8, result_kind, "tool_search_tool_search_result")) {
+                    const refs = content_.get("tool_references") orelse Value{ .array = &.{} };
+                    if (refs != .array) return cx.refuse("tool_search_tool_result.tool_references must be an array");
+                    try marker.object.put(a, "references", refs);
+                } else return cx.fail(.request, "unsupported tool_search_tool_result content type {s}", .{try pyrepr.repr(a, content_.get("type"))});
+                search_at = null;
             } else if (std.mem.eql(u8, k, "tool_result") and user) {
                 var texts: std.ArrayList([]const u8) = .empty;
                 var result_parts: std.ArrayList(Value) = .empty;

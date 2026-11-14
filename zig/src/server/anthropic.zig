@@ -10,6 +10,7 @@ const prompt = @import("prompt.zig");
 const routes = @import("routes.zig");
 const sse = @import("sse.zig");
 const tool_specs = @import("tool_specs.zig");
+const tool_search = @import("tool_search.zig");
 const ids = @import("ids.zig");
 const auth = @import("auth.zig");
 const translate = @import("anthropic_translate.zig").translate;
@@ -54,7 +55,9 @@ fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
     const declared = try tool_specs.active(cx, chat.get("tools"), chat.get("tool_choice"));
     // a deferred tool is declared but not shown: the count is what the prompt renders
     const tools = if (tool_specs.anyDeferred(declared)) try tool_specs.published(cx.a, declared) else declared;
-    const msgs = try messages_mod.normalizeWith(cx, chat.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
+    // a search block leaves a placeholder until the request's tools are known, and the count is what renders
+    const resolved = try tool_search.resolve(cx.a, cx, chat.get("messages") orelse Value.null, srv.late_system, declared);
+    const msgs = try messages_mod.normalizeWith(cx, resolved, "system", srv.needs_user_after_tool, .of(srv.info.vision));
     const ids_ = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true) catch |e| switch (e) {
         error.Refused => return cx.other(cx.message),
         else => |x| return x,
@@ -75,6 +78,17 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             .err => |m| return sendError(conn, a, m, 400),
         };
         const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
+        // Anthropic deferred loading: a replayed search carries its blocks as placeholders until the request's own
+        // tools can expand them, and the expansion must sit where the live request put it or the prefix moves.
+        const declared = tool_specs.active(&cx, chat.get("tools"), chat.get("tool_choice")) catch |e| switch (e) {
+            error.Refused => return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400),
+            else => return,
+        };
+        const resolved = tool_search.resolve(a, &cx, chat.get("messages") orelse Value.null, srv.late_system, declared) catch |e| switch (e) {
+            error.Refused => return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400),
+            else => return,
+        };
+        chat.object.put(a, "messages", resolved) catch return;
         if (count) {
             const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400);
             const o = json.newObject(a) catch return;

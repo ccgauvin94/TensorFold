@@ -3,6 +3,8 @@
 //! request's own tool list, so a search costs nothing but a walk.
 const std = @import("std");
 const json = @import("json");
+const errors = @import("errors.zig");
+const messages_mod = @import("messages.zig");
 const Allocator = std.mem.Allocator;
 const Value = json.Value;
 
@@ -496,4 +498,96 @@ pub fn derive(a: Allocator, role: []const u8, tools: []const Value, variant: Var
         .call = try callText(a, variant, input),
         .expansion = try expansionMessage(a, role, leafOf(variant), stringField(input, leafOf(variant)), refs, tools),
     };
+}
+
+/// The role a translated request carries where an expansion belongs. Never a role a client can send: the marker is
+/// produced by the translate pass and consumed here.
+pub const placeholder = "__tensorfold_tool_search";
+
+pub fn isPlaceholder(m: Value) bool {
+    if (m != .object) return false;
+    const role = m.strField("role") orelse return false;
+    return std.mem.eql(u8, role, placeholder);
+}
+
+/// Folds every placeholder a translated request carries back into turns the model reads: the canonical call line
+/// into the assistant turn the search block was cut from, and the expansion message after it. ``role`` is the
+/// server's late-system role, so a template that keeps a later system message gets one and any other gets a user
+/// turn — the same message either way, only the role differs.
+pub fn resolve(a: Allocator, cx: *errors.Cx, messages: Value, role: []const u8, tools: []const Value) errors.Refused!Value {
+    if (messages != .array) return messages;
+    var out: std.ArrayList(Value) = .empty;
+    for (messages.array) |m| {
+        if (!isPlaceholder(m)) {
+            try out.append(a, m);
+            continue;
+        }
+        const input = m.get("input") orelse Value.null;
+        const previous = if (out.items.len > 0) out.items[out.items.len - 1] else Value.null;
+        const previous_role = if (previous == .object) (previous.strField("role") orelse "") else "";
+        if (!std.mem.eql(u8, previous_role, "assistant")) return cx.refuse("a tool search result must follow the assistant turn that called it");
+
+        // a search that could not run says so; the model must not read a silent gap as a successful search
+        if (m.get("error_code")) |code| {
+            if (code == .string) {
+                const why = m.get("error_message") orelse Value.null;
+                const text = try std.fmt.allocPrint(a, "Tool search failed ({s}): {s}. Nothing was added; use the tools you can already see.", .{ code.string, (if (why == .string) why.string else "") });
+                out.items[out.items.len - 1] = try withCall(a, previous, try callText(a, variantOf(input), input));
+                try out.append(a, try plainMessage(a, role, text));
+                continue;
+            }
+        }
+
+        const refs_value = m.get("references") orelse Value{ .array = &.{} };
+        if (refs_value != .array) return cx.refuse("a tool search result must list its references");
+        const refs = try a.alloc([]const u8, refs_value.array.len);
+        for (refs_value.array, refs) |item, *slot| {
+            const name = if (item == .object) (item.strField("tool_name") orelse "") else "";
+            if (name.len == 0) return cx.refuse("a tool reference must name its tool");
+            slot.* = name;
+        }
+        // the contract's other 400: a reference with no definition in this request
+        if (missing(tools, refs)) |name| return cx.fail(.request, "Tool reference '{s}' not found in available tools", .{name});
+
+        const derived = try derive(a, role, tools, variantOf(input), input, refs);
+        out.items[out.items.len - 1] = try withCall(a, previous, derived.call);
+        try out.append(a, derived.expansion);
+    }
+    return .{ .array = out.items };
+}
+
+/// Which variant a set of search inputs belongs to: the bm25 tool asks for a query, the regex one for a pattern.
+fn variantOf(input: Value) Variant {
+    return if (input == .object and input.get("query") != null) .bm25 else .regex;
+}
+
+/// ``msg`` with ``call`` appended to its content, as the text part the template renders.
+fn withCall(a: Allocator, msg: Value, call: []const u8) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    if (msg == .object) {
+        var it = msg.object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "content")) try o.put(a, entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    var parts: std.ArrayList(Value) = .empty;
+    if (msg == .object) {
+        if (msg.get("content")) |content| switch (content) {
+            .string => |text| {
+                if (text.len > 0) try parts.append(a, try messages_mod.textPart(a, text));
+            },
+            .array => |items| for (items) |item| try parts.append(a, item),
+            else => {},
+        };
+    }
+    try parts.append(a, try messages_mod.textPart(a, call));
+    try o.put(a, "content", .{ .array = parts.items });
+    return .{ .object = o };
+}
+
+fn plainMessage(a: Allocator, role: []const u8, text: []const u8) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    try o.put(a, "role", .{ .string = role });
+    try o.put(a, "content", .{ .string = text });
+    return .{ .object = o };
 }

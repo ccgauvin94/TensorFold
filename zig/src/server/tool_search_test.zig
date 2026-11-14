@@ -3,6 +3,9 @@
 const std = @import("std");
 const json = @import("json");
 const search = @import("tool_search.zig");
+const errors = @import("errors.zig");
+const tool_specs = @import("tool_specs.zig");
+const translate = @import("anthropic_translate.zig").translate;
 
 const tools_json =
     \\[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a location","parameters":{"type":"object","properties":{"location":{"type":"string","description":"City and state"}}}}},
@@ -234,4 +237,57 @@ test "a replayed search derives exactly the turns the live request appended" {
     // a limit is part of the inputs and so part of the canonical line
     const with_limit = try search.derive(a, "system", list, .bm25, try args(a, "{\"query\":\"weather\",\"limit\":3}"), &refs);
     try std.testing.expectEqualStrings("Tool search: query=\"weather\", limit=3", with_limit.call);
+}
+
+test "a replayed assistant turn is cut at the search, as the live request wrote it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const body = try args(a,
+        \\{"model":"m","max_tokens":64,
+        \\ "tools":[{"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"},
+        \\          {"name":"get_weather","description":"Get the current weather","input_schema":{"type":"object","properties":{"location":{"type":"string"}}},"defer_loading":true}],
+        \\ "messages":[{"role":"user","content":"what is the weather?"},
+        \\  {"role":"assistant","content":[
+        \\    {"type":"text","text":"Let me look for a tool."},
+        \\    {"type":"server_tool_use","id":"srvtoolu_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}},
+        \\    {"type":"tool_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}},
+        \\    {"type":"text","text":"Found it."},
+        \\    {"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"location":"Bozeman"}}]},
+        \\  {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"12C"}]}]}
+    );
+
+    var cx: errors.Cx = .{ .a = a };
+    const chat = try translate(&cx, body, false);
+    const declared = try tool_specs.active(&cx, chat.get("tools"), null);
+
+    const resolved = try search.resolve(a, &cx, chat.get("messages").?, "system", declared);
+    const msgs = resolved.array;
+    try std.testing.expectEqual(@as(usize, 5), msgs.len);
+
+    // the assistant turn stops at the search: its prose and the canonical call line, and no tool call
+    const first = msgs[1];
+    try std.testing.expectEqualStrings("assistant", first.get("role").?.string);
+    try std.testing.expect(first.get("tool_calls") == null);
+    const parts = first.get("content").?.array;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("Let me look for a tool.", parts[0].get("text").?.string);
+    try std.testing.expectEqualStrings("Tool search: pattern=\"weather\"", parts[1].get("text").?.string);
+
+    // then the expansion, as the late system message the template keeps
+    const expansion = msgs[2];
+    try std.testing.expectEqualStrings("system", expansion.get("role").?.string);
+    const text = expansion.get("content").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Tool: get_weather") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Get the current weather") != null);
+
+    // and the reply continues in a new assistant turn, which is where the client's own tool call lives
+    const continued = msgs[3];
+    try std.testing.expectEqualStrings("assistant", continued.get("role").?.string);
+    try std.testing.expectEqualStrings("Found it.", continued.get("content").?.array[0].get("text").?.string);
+    try std.testing.expectEqualStrings("get_weather", continued.get("tool_calls").?.array[0].get("function").?.get("name").?.string);
+
+    // the tool result still ends the conversation as a tool turn
+    try std.testing.expectEqualStrings("tool", msgs[4].get("role").?.string);
 }
