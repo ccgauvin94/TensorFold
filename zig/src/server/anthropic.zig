@@ -328,11 +328,23 @@ fn extendForSearch(a: Allocator, srv: *Server, declared: []const Value, body: Va
     try turn.put(a, "role", .{ .string = "assistant" });
     try turn.put(a, "content", .{ .array = parts.items });
     try out.append(a, .{ .object = turn });
-    const expansion = switch (outcome) {
-        .found => |names| try tool_search.derive(a, srv.late_system, declared, variant, input, names),
-        .failed => null,
-    };
-    if (expansion) |derived| try out.append(a, derived.expansion);
+    switch (outcome) {
+        .found => |names| {
+            const derived = try tool_search.derive(a, srv.late_system, declared, variant, input, names);
+            try out.append(a, derived.expansion);
+        },
+        // A search that could not run has to say so in the prompt: without it the continuation
+        // reads as silence, and a model that asked for a tool simply stops.
+        .failed => |why| {
+            const leaf: []const u8 = if (variant == .bm25) "query" else "pattern";
+            const asked = if (input == .object) (input.strField(leaf) orelse "") else "";
+            const text = try std.fmt.allocPrint(a, "Tool search ({s} \"{s}\") failed: {s} — {s}. Nothing was added; use the tools you can already see.", .{ leaf, asked, why.code, why.message });
+            const note = try json.newObject(a);
+            try note.put(a, "role", .{ .string = srv.late_system });
+            try note.put(a, "content", .{ .string = text });
+            try out.append(a, .{ .object = note });
+        },
+    }
     try body.object.put(a, "messages", .{ .array = out.items });
 }
 

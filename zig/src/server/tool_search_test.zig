@@ -106,9 +106,10 @@ test "a search that cannot run reports invalid_tool_input" {
     const a = arena.allocator();
     const list = try tools(a);
 
-    // groups and the shorthand classes are Python's, not ours: refuse rather than match something else
-    const grouped = try search.run(a, list, .regex, try args(a, "{\"pattern\":\"(weather|rain)\"}"));
-    try std.testing.expectEqualStrings("invalid_tool_input", grouped.failed.code);
+    // a plain group is expanded into alternatives; one this matcher cannot express, and the shorthand
+    // classes, are refused rather than matched some other way
+    const quantified = try search.run(a, list, .regex, try args(a, "{\"pattern\":\"(get_)+_weather\"}"));
+    try std.testing.expectEqualStrings("invalid_tool_input", quantified.failed.code);
 
     const shorthand = try search.run(a, list, .regex, try args(a, "{\"pattern\":\"\\\\d+\"}"));
     try std.testing.expectEqualStrings("invalid_tool_input", shorthand.failed.code);
@@ -382,4 +383,28 @@ test "a tool found twice is defined once, so a replayed search cannot restate it
     }
     try std.testing.expectEqual(@as(usize, 1), definitions);
     try std.testing.expectEqual(@as(usize, 1), repeat_notes);
+}
+
+test "a group a model writes is expanded into alternatives, not refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // the pattern a live chat actually sent, which this search refused as invalid_tool_input
+    const hits = switch (try search.run(a, try tools(a), .regex, try args(a, "{\"pattern\":\"get_(weather|user_data)\"}"))) {
+        .found => |found_names| found_names,
+        .failed => |why| {
+            std.debug.print("refused: {s} {s}\n", .{ why.code, why.message });
+            return error.Refused;
+        },
+    };
+    try std.testing.expect(has(hits, "get_weather"));
+    try std.testing.expect(has(hits, "get_user_data"));
+    try std.testing.expect(!has(hits, "send_email"));
+
+    // a quantified or nested group is still reported rather than guessed at
+    switch (try search.run(a, try tools(a), .regex, try args(a, "{\"pattern\":\"(get)+_weather\"}"))) {
+        .failed => |why| try std.testing.expectEqualStrings("invalid_tool_input", why.code),
+        .found => return error.ShouldHaveRefused,
+    }
 }

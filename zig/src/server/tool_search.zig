@@ -198,13 +198,64 @@ fn rank(a: Allocator, hits: std.ArrayList(Hits), limit: usize) Allocator.Error![
 
 fn regex(a: Allocator, tools: []const Value, pattern: []const u8, limit: usize) Allocator.Error!Outcome {
     if (pattern.len > max_pattern) return fail(bad_input, "pattern must be at most 200 characters");
-    if (!supported(pattern)) return fail(bad_input, "the pattern uses a construct this search does not support: use literals, ., *, +, ?, [...], ^, $ and |");
+    // `prefix(a|b|c)` is what a model actually writes; expanding it keeps the matcher free of groups
+    const expanded = (try expandGroups(a, pattern)) orelse return fail(bad_input, "the pattern uses a construct this search does not support: use literals, ., *, +, ?, [...], ^, $ and |");
+    if (!supported(expanded)) return fail(bad_input, "the pattern uses a construct this search does not support: use literals, ., *, +, ?, [...], ^, $ and |");
     var hits: std.ArrayList(Hits) = .empty;
     for (tools) |tool| {
         const text = try fields(a, tool);
-        if (matches(pattern, text)) try hits.append(a, .{ .name = nameOf(tool), .score = 1 });
+        if (matches(expanded, text)) try hits.append(a, .{ .name = nameOf(tool), .score = 1 });
     }
     return .{ .found = try rank(a, hits, limit) };
+}
+
+/// Rewrites the groups a model writes into plain alternatives — `k_ir__(now|timeline)` becomes
+/// `k_ir__now|k_ir__timeline` — so the matcher never has to implement one. Null for anything it
+/// cannot express that way (nested, quantified, unbalanced, or a cross-product past the budget),
+/// which is reported rather than guessed at.
+fn expandGroups(a: Allocator, pattern: []const u8) Allocator.Error!?[]const u8 {
+    var current: std.ArrayList([]const u8) = .empty;
+    try current.append(a, pattern);
+    var budget: usize = 64;
+    while (true) {
+        var changed = false;
+        var next: std.ArrayList([]const u8) = .empty;
+        for (current.items) |alt| {
+            const open = std.mem.indexOfScalar(u8, alt, '(') orelse {
+                try next.append(a, alt);
+                continue;
+            };
+            var close: ?usize = null;
+            var i = open + 1;
+            while (i < alt.len) : (i += 1) {
+                if (alt[i] == '(') return null; // nested: not expressible here
+                if (alt[i] == ')') {
+                    close = i;
+                    break;
+                }
+            }
+            const end = close orelse return null;
+            if (end + 1 < alt.len and (alt[end + 1] == '*' or alt[end + 1] == '+' or alt[end + 1] == '?')) return null;
+            const head = alt[0..open];
+            const body = alt[open + 1 .. end];
+            const tail = alt[end + 1 ..];
+            var choices = std.mem.splitScalar(u8, body, '|');
+            while (choices.next()) |choice| {
+                if (budget == 0) return null;
+                budget -= 1;
+                try next.append(a, try std.mem.concat(a, u8, &.{ head, choice, tail }));
+            }
+            changed = true;
+        }
+        current = next;
+        if (!changed) break;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    for (current.items, 0..) |alt, i| {
+        if (i > 0) try out.append(a, '|');
+        try out.appendSlice(a, alt);
+    }
+    return out.items;
 }
 
 /// False when the pattern uses something this matcher does not implement.
