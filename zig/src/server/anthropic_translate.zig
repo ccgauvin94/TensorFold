@@ -306,7 +306,6 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
     if (tools != .array) return cx.refuse("tools must be an array");
     var translated: std.ArrayList(Value) = .empty;
     var deferred: usize = 0;
-    var deferred_names: std.ArrayList([]const u8) = .empty;
     for (tools.array) |tool| {
         const kind = if (tool == .object) tool.get("type") orelse Value{ .string = "custom" } else Value.null;
         if (tool != .object or kind != .string) return cx.refuse("only client-defined function tools and the tool search tools are supported");
@@ -322,7 +321,6 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
         const is_deferred = json.truthyField(tool, "defer_loading");
         if (is_deferred) deferred += 1;
         const name = try string(cx, tool.get("name"), "tool.name", false);
-        if (is_deferred) try deferred_names.append(a, name);
         const schema = tool.get("input_schema") orelse Value.null;
         if (schema != .object) return cx.refuse("tool.input_schema must be an object");
         const function = try json.newObject(a);
@@ -337,18 +335,6 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
     }
     // Anthropic's 400: a search tool is the only way back, so something must be visible without one
     if (deferred > 0 and deferred == translated.items.len) return cx.refuse("At least one tool must have defer_loading=false. All tools cannot be deferred.");
-    // The search tool is published, so naming what it can find costs one line in the head instead of every schema.
-    // Without it the model is guessing at names it has never seen, which is where a deferred catalogue stops being
-    // useful: a search it cannot aim is a search that returns nothing.
-    if (deferred_names.items.len > 0) for (translated.items) |tool| {
-        if (tool.get("x_tensorfold_server_tool") == null) continue;
-        const function = tool.get("function") orelse continue;
-        if (function != .object) continue;
-        const names = try std.mem.join(a, ", ", deferred_names.items);
-        const said = try std.fmt.allocPrint(a, "{s}\n\nTools this search can find, by exact name or a pattern that matches one: {s}", .{ function.strField("description") orelse "", names });
-        try function.object.put(a, "description", .{ .string = said });
-        break;
-    };
     if (translated.items.len > 0) try chat.put(a, "tools", .{ .array = translated.items });
     if (body.field("tool_choice")) |choice| {
         if (choice != .object) return cx.refuse("tool_choice must be an object");
