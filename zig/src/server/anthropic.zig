@@ -151,6 +151,12 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
     while (true) : (rounds += 1) {
         reply.prose.clearRetainingCapacity();
         reply.search = null;
+        // Each round numbers its tool calls from zero again, and a finished call is skipped when the
+        // stream drains — so a call in round two would be swallowed by round one's entry and never
+        // reach the client. The block index keeps counting; the calls start over.
+        reply.calls.clearRetainingCapacity();
+        reply.active = null;
+        reply.pending.clearRetainingCapacity();
         openai.run(srv, a, wire.out(), .{ .conn = conn }, true, chat_body);
         if (conn.broken) return;
         if (wire.status) |status| {
