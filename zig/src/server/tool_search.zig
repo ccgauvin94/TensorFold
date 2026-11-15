@@ -517,6 +517,11 @@ pub fn isPlaceholder(m: Value) bool {
 pub fn resolve(a: Allocator, cx: *errors.Cx, messages: Value, role: []const u8, tools: []const Value) errors.Refused!Value {
     if (messages != .array) return messages;
     var out: std.ArrayList(Value) = .empty;
+    // A tool is defined ONCE per request, however many times it was found. The client
+    // echoes every search it ever made (that is the contract), so re-deriving each result
+    // restated definitions the model already had: a chat that searched three times saw the
+    // same schemas re-added, and said so — "tool search keeps re-adding tools".
+    var defined: std.StringHashMapUnmanaged(void) = .empty;
     for (messages.array) |m| {
         if (!isPlaceholder(m)) {
             try out.append(a, m);
@@ -549,9 +554,24 @@ pub fn resolve(a: Allocator, cx: *errors.Cx, messages: Value, role: []const u8, 
         // the contract's other 400: a reference with no definition in this request
         if (missing(tools, refs)) |name| return cx.fail(.request, "Tool reference '{s}' not found in available tools", .{name});
 
-        const derived = try derive(a, role, tools, variantOf(input), input, refs);
+        const fresh = try a.alloc([]const u8, refs.len);
+        var fresh_count: usize = 0;
+        for (refs) |name| {
+            if ((try defined.getOrPut(a, name)).found_existing) continue;
+            fresh[fresh_count] = name;
+            fresh_count += 1;
+        }
+
+        const derived = try derive(a, role, tools, variantOf(input), input, fresh[0..fresh_count]);
         out.items[out.items.len - 1] = try withCall(a, previous, derived.call);
-        try out.append(a, derived.expansion);
+        if (fresh_count > 0) {
+            try out.append(a, derived.expansion);
+        } else {
+            // a repeat search must not read as a silent gap, and must not restate schemas
+            const leaf = leafOf(variantOf(input));
+            const text = try std.fmt.allocPrint(a, "Tool search ({s} \"{s}\") matched only tools that are already defined above. Nothing was added.", .{ leaf, stringField(input, leaf) });
+            try out.append(a, try plainMessage(a, role, text));
+        }
     }
     return .{ .array = out.items };
 }

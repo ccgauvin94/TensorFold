@@ -341,3 +341,45 @@ test "a search that opens the assistant turn still has a turn to fold the call i
     try std.testing.expectEqualStrings("system", msgs[2].get("role").?.string);
     try std.testing.expectEqualStrings("get_weather", msgs[3].get("tool_calls").?.array[0].get("function").?.get("name").?.string);
 }
+
+test "a tool found twice is defined once, so a replayed search cannot restate it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The shape a live chat produced: the client echoes every search it ever made, so the
+    // same tool comes back on each turn. Re-deriving each result restated the schema, and
+    // the model itself said so — "tool search keeps re-adding tools".
+    const body = try args(a,
+        \\{"model":"m","max_tokens":64,
+        \\ "tools":[{"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"},
+        \\          {"name":"get_weather","description":"Get the current weather","input_schema":{"type":"object","properties":{"location":{"type":"string"}}},"defer_loading":true}],
+        \\ "messages":[{"role":"user","content":"weather?"},
+        \\  {"role":"assistant","content":[
+        \\    {"type":"server_tool_use","id":"srvtoolu_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}},
+        \\    {"type":"tool_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}},
+        \\    {"type":"text","text":"Found it."}]},
+        \\  {"role":"user","content":"and again?"},
+        \\  {"role":"assistant","content":[
+        \\    {"type":"server_tool_use","id":"srvtoolu_2","name":"tool_search_tool_regex","input":{"pattern":"weather"}},
+        \\    {"type":"tool_search_tool_result","tool_use_id":"srvtoolu_2","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}},
+        \\    {"type":"text","text":"Still there."}]}]}
+    );
+
+    var cx: errors.Cx = .{ .a = a };
+    const chat = try translate(&cx, body, false);
+    const declared = try tool_specs.active(&cx, chat.get("tools"), null);
+    const resolved = try search.resolve(a, &cx, chat.get("messages").?, "system", declared);
+
+    var definitions: usize = 0;
+    var repeat_notes: usize = 0;
+    for (resolved.array) |m| {
+        const role = m.strField("role") orelse continue;
+        if (!std.mem.eql(u8, role, "system")) continue;
+        const text = m.get("content").?.string;
+        if (std.mem.indexOf(u8, text, "## Tool: get_weather") != null) definitions += 1;
+        if (std.mem.indexOf(u8, text, "already defined above") != null) repeat_notes += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), definitions);
+    try std.testing.expectEqual(@as(usize, 1), repeat_notes);
+}

@@ -107,12 +107,12 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     const declared = tool_specs.active(&cx, prepared[0].get("tools"), prepared[0].get("tool_choice")) catch {
         return sendError(conn, a, cx.message, 400);
     };
-    // A reply that may carry a search is assembled before it is streamed: the search blocks land mid-message and the
-    // rounds after them continue the same message, which the incremental path cannot open yet. The rounds run
-    // without streaming and the finished message is emitted as the events it would have produced.
-    const buffered_search = body_streamed and srv.config.tool_search and anyServerTool(declared);
     const chat_body = prepared[0]; // the maps inside it are mutated between rounds
-    if (buffered_search) chat_body.object.put(a, "stream", .{ .bool = false }) catch return;
+
+    if (body_streamed) return streamed(srv, conn, a, prepared[1], declared, chat_body);
+
+    // Not streamed: the rounds are assembled and answered whole, and the search blocks sit in front of the
+    // content the last round produced.
     var blocks: std.ArrayList(Value) = .empty;
     var rounds: usize = 0;
     while (true) : (rounds += 1) {
@@ -137,8 +137,48 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             return sendError(conn, a, message, 500);
         };
         splice(a, whole, blocks.items) catch return;
-        if (buffered_search) return emitAsSse(conn, a, whole);
         return routes.sendValue(conn, a, 200, whole);
+    }
+}
+
+/// A streamed reply, including one that calls a search: the message is opened once and every round continues it,
+/// so the deltas reach the client as the model produces them instead of arriving together at the end.
+fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []const Value, chat_body: Value) void {
+    var reply: Reply = .{ .a = a, .conn = conn, .model = openai.replyModel(srv, body), .declared = declared };
+    reply.init() catch return;
+    var wire: Wire = .{ .reply = &reply };
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        reply.prose.clearRetainingCapacity();
+        reply.search = null;
+        openai.run(srv, a, wire.out(), .{ .conn = conn }, true, chat_body);
+        if (conn.broken) return;
+        if (wire.status) |status| {
+            // the runner answered whole although the request streamed: emit that instead of events
+            if (status != 200) {
+                const problem = wire.payload.get("error") orelse Value.null;
+                const message = if (problem == .object) (if (problem.get("message")) |m| (if (m == .string) m.string else "request failed") else "request failed") else (if (problem == .string) problem.string else "request failed");
+                return sendError(conn, a, message, status);
+            }
+            const whole = reply.completion(wire.payload) catch return;
+            return routes.sendValue(conn, a, 200, whole);
+        }
+        const input = reply.search orelse return; // the runner closed the message
+        if (rounds >= max_search_rounds) {
+            const e = errorValue(a, "the model kept searching for tools without answering", 503) catch return;
+            sse.event(conn, a, "error", e) catch {};
+            return;
+        }
+        const variant: tool_search.Variant = if (input == .object and input.get("query") != null) .bm25 else .regex;
+        const outcome = tool_search.run(a, declared, variant, input) catch return;
+        const id = std.fmt.allocPrint(a, "srvtoolu_{d}", .{rounds + 1}) catch return;
+        // the call block is already on the wire; what the contract wants next is its result, whole
+        const result_block = switch (outcome) {
+            .found => |names| tool_search.result(a, id, names) catch return,
+            .failed => |why| tool_search.failure(a, id, why) catch return,
+        };
+        reply.wholeBlock(result_block) catch return;
+        extendForSearch(a, srv, declared, chat_body, reply.prose.items, variant, input, outcome) catch return;
     }
 }
 
@@ -270,25 +310,30 @@ fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), 
 
     // the continuation: everything so far, then the assistant turn as the prompt will render it on replay, then the
     // expansion in the server's late-system role
+    const prose = if (message.get("content")) |p| (if (p == .string) p.string else "") else "";
+    try extendForSearch(a, srv, declared, body, prose, variant, found.input, outcome);
+    return true;
+}
+
+/// Extends the request with what the continuation needs: the assistant turn as the prompt will render it on replay,
+/// then the expansion in the server's late-system role. Shared by the assembled and the streamed path.
+fn extendForSearch(a: Allocator, srv: *Server, declared: []const Value, body: Value, prose: []const u8, variant: tool_search.Variant, input: Value, outcome: tool_search.Outcome) Allocator.Error!void {
     const messages = body.get("messages") orelse Value{ .array = &.{} };
     var out: std.ArrayList(Value) = .empty;
     if (messages == .array) for (messages.array) |m| try out.append(a, m);
     var parts: std.ArrayList(Value) = .empty;
-    if (message.get("content")) |prose| {
-        if (prose == .string and prose.string.len > 0) try parts.append(a, try messages_mod.textPart(a, prose.string));
-    }
-    try parts.append(a, try messages_mod.textPart(a, try tool_search.callText(a, variant, found.input)));
+    if (prose.len > 0) try parts.append(a, try messages_mod.textPart(a, prose));
+    try parts.append(a, try messages_mod.textPart(a, try tool_search.callText(a, variant, input)));
     const turn = try json.newObject(a);
     try turn.put(a, "role", .{ .string = "assistant" });
     try turn.put(a, "content", .{ .array = parts.items });
     try out.append(a, .{ .object = turn });
     const expansion = switch (outcome) {
-        .found => |names| try tool_search.derive(a, srv.late_system, declared, variant, found.input, names),
+        .found => |names| try tool_search.derive(a, srv.late_system, declared, variant, input, names),
         .failed => null,
     };
     if (expansion) |derived| try out.append(a, derived.expansion);
     try body.object.put(a, "messages", .{ .array = out.items });
-    return true;
 }
 
 /// The blocks the searches produced, in front of the last round's content.
@@ -312,6 +357,9 @@ const Wire = struct {
 
     fn open(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
+        // one message across every round: a search round is answered and the next round continues it, so a
+        // second open would restart the stream the client is already reading
+        if (w.opened) return;
         w.opened = true;
         // the head counts the whole prompt; message_delta's usage splits it into input and cache_read
         if (prompt_len > 0) {
@@ -346,6 +394,14 @@ const Reply = struct {
     a: Allocator,
     conn: *Conn,
     model: []const u8,
+    /// The request's declared tools, so a call to one of the engine's own search tools is emitted as the
+    /// `server_tool_use` block the contract asks for instead of a `tool_use` the client would try to run.
+    declared: []const Value = &.{},
+    /// The prose of the round in flight, which the continuation's assistant turn is built from.
+    prose: std.ArrayList(u8) = .empty,
+    /// Set when this round called a search: the round loop answers it and runs another round on this same
+    /// reply, so the message stays open instead of being closed out at the round boundary.
+    search: ?Value = null,
     base: *json.Object = undefined,
     index: i64 = -1,
     kind: ?[]const u8 = null,
@@ -410,8 +466,22 @@ const Reply = struct {
         r.kind = null;
     }
 
-    fn text(r: *Reply, kind: []const u8, value: []const u8) E!void {
-        if (value.len == 0) return;
+    /// One block, opened and closed with no deltas between: a search result arrives whole.
+    fn wholeBlock(r: *Reply, block: Value) E!void {
+        if (block != .object) return;
+        try r.close();
+        r.index += 1;
+        const opened = try r.obj("content_block_start");
+        try r.put(opened, "index", json.intValue(r.a, r.index) catch return error.Closed);
+        try r.put(opened, "content_block", block);
+        try r.send("content_block_start", opened);
+        const closed = try r.obj("content_block_stop");
+        try r.put(closed, "index", json.intValue(r.a, r.index) catch return error.Closed);
+        try r.send("content_block_stop", closed);
+    }
+
+    fn text(r: *Reply, kind: []const u8, value: []const u8) E!void {        if (value.len == 0) return;
+        if (std.mem.eql(u8, kind, "text")) r.prose.appendSlice(r.a, value) catch return error.Closed;
         if (r.active != null) {
             r.pending.append(r.a, .{ .kind = kind, .text = value }) catch return error.Closed;
             return;
@@ -441,6 +511,9 @@ const Reply = struct {
         const p = payload orelse {
             try r.drain(true);
             try r.close();
+            // a round that called a search is not the end of the message: the loop answers it and runs
+            // another round on this same reply, so closing out here would end the stream mid-reply
+            if (r.search != null) return;
             const d = json.newObject(r.a) catch return error.Closed;
             try r.put(d, "stop_reason", .{ .string = r.finish });
             try r.put(d, "stop_sequence", r.stop_sequence);
@@ -498,12 +571,13 @@ const Reply = struct {
         for (r.calls.keys(), r.calls.values()) |at, *call| {
             if (call.done) continue;
             if (call.id.len == 0 or call.name.len == 0) return;
+            const server = serverTool(r.declared, call.name);
             if (r.active == null) {
                 try r.close();
                 r.index += 1;
-                r.kind = "tool_use";
+                r.kind = if (server) "server_tool_use" else "tool_use";
                 r.active = at;
-                const block = try r.obj("tool_use");
+                const block = try r.obj(r.kind.?);
                 try r.put(block, "id", .{ .string = call.id });
                 try r.put(block, "name", .{ .string = call.name });
                 try r.put(block, "input", .{ .object = json.newObject(r.a) catch return error.Closed });
@@ -531,6 +605,15 @@ const Reply = struct {
             try r.close();
             call.done = true;
             r.active = null;
+            // a search the model asked for: the round loop answers it and continues this same message
+            if (server) {
+                const raw = call.arguments;
+                const input = if (raw.len == 0) Value{ .object = json.newObject(r.a) catch return error.Closed } else switch (json.parseText(r.a, raw) catch return error.Closed) {
+                    .ok => |v| v,
+                    .err => Value{ .object = json.newObject(r.a) catch return error.Closed },
+                };
+                r.search = input;
+            }
             const pending = r.pending.items;
             r.pending = .empty;
             for (pending) |p| try r.text(p.kind, p.text);
