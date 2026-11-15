@@ -569,7 +569,7 @@ pub fn publish(tools: []const Value, names: []const []const u8) void {
         const name = tool.strField("name") orelse continue;
         for (names) |found| {
             if (!std.mem.eql(u8, name, found)) continue;
-            _ = tool.object.fetchRemove("defer_loading");
+            _ = tool.object.orderedRemove("defer_loading");
             break;
         }
     }
