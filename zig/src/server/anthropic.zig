@@ -177,6 +177,7 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
         }
         const variant: tool_search.Variant = if (input == .object and input.get("query") != null) .bm25 else .regex;
         const outcome = tool_search.run(a, declared, variant, input) catch return;
+        if (outcome == .found) tool_search.publish(declared, outcome.found);
         const id = std.fmt.allocPrint(a, "srvtoolu_{d}", .{rounds + 1}) catch return;
         // the call block is already on the wire; what the contract wants next is its result, whole
         const result_block = switch (outcome) {
@@ -307,6 +308,7 @@ fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), 
 
     const variant: tool_search.Variant = if (found.input == .object and found.input.get("query") != null) .bm25 else .regex;
     const outcome = try tool_search.run(a, declared, variant, found.input);
+    if (outcome == .found) tool_search.publish(declared, outcome.found);
     const id = try std.fmt.allocPrint(a, "srvtoolu_{d}", .{blocks.items.len + 1});
     try blocks.append(a, try tool_search.serverToolUse(a, id, found.name, found.input));
     switch (outcome) {

@@ -561,6 +561,20 @@ pub fn isPlaceholder(m: Value) bool {
     return std.mem.eql(u8, role, placeholder);
 }
 
+/// Clears ``defer_loading`` on the tools a search returned, in place: the request's tool entries are
+/// shared with the chat body, so the template sees them as published.
+pub fn publish(tools: []const Value, names: []const []const u8) void {
+    for (tools) |tool| {
+        if (tool != .object) continue;
+        const name = tool.strField("name") orelse continue;
+        for (names) |found| {
+            if (!std.mem.eql(u8, name, found)) continue;
+            _ = tool.object.fetchRemove("defer_loading");
+            break;
+        }
+    }
+}
+
 /// Folds every placeholder a translated request carries back into turns the model reads: the canonical call line
 /// into the assistant turn the search block was cut from, and the expansion message after it. ``role`` is the
 /// server's late-system role, so a template that keeps a later system message gets one and any other gets a user
@@ -604,6 +618,11 @@ pub fn resolve(a: Allocator, cx: *errors.Cx, messages: Value, role: []const u8, 
         }
         // the contract's other 400: a reference with no definition in this request
         if (missing(tools, refs)) |name| return cx.fail(.request, "Tool reference '{s}' not found in available tools", .{name});
+
+        // A tool this history discovered is loaded from here on: the request's own tool list stops
+        // deferring it, so the template publishes it and the model can call it instead of only
+        // reading about it.
+        publish(tools, refs);
 
         const fresh = try a.alloc([]const u8, refs.len);
         var fresh_count: usize = 0;
