@@ -124,24 +124,63 @@ test "split ranks write and restore their own pages (rank 0 and 1 of 2)" {
     try roundTrip(2, 1);
 }
 
-test "split reconcile refuses before deleting temporary files or indexing physical bytes" {
+test "split reconcile indexes a rank's own file: temporary files go, the file is charged as it is" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
-    const d = try disk.Disk.open(gpa, io, .{ .root = root, .compat = @splat(9), .world = 2 });
-    defer d.close();
-    const f = try d.dir.createFile(io, "unreconciled.tmp", .{});
-    f.close(io);
-    var found: std.ArrayList(disk.Disk.Found) = .empty;
-    defer found.deinit(gpa);
-    try testing.expectError(error.SplitReconcileUnsupported, d.scan(&found));
-    try testing.expectEqual(@as(usize, 0), d.recs.items.len);
-    try testing.expectEqual(@as(u64, 0), d.used);
-    const kept = try d.dir.openFile(io, "unreconciled.tmp", .{});
-    kept.close(io);
+    const world: u32 = 2;
+    const rank: u32 = 0;
+
+    var p = try Pool.init(gpa, .{ .families = &fams, .page = 256 }, 64 * 256, world, rank);
+    defer p.deinit();
+    var h = try HostPool.init(gpa, &p);
+    defer h.deinit();
+    var blob: [5000]u8 = undefined;
+    for (&blob, 0..) |*x, i| x.* = @truncate(9 - i % 5);
+    const pos: u64 = 9 * 256 + 100;
+    const ids = try gpa.alloc(i32, pos);
+    defer gpa.free(ids);
+    for (ids, 0..) |*t, i| t.* = @intCast(i * 3 + 1);
+
+    var written: u64 = 0;
+    var logical: u64 = 0;
+    {
+        const d = try disk.Disk.open(gpa, io, .{ .root = root, .compat = @splat(9), .rank = rank, .world = world, .chunk = 3 * 74_752, .staging = 3, .lanes = 3, .min_tokens = 1 });
+        defer d.close();
+        const a = try p.newSlot(32 * 256);
+        try a.ensure(pos);
+        for (a.mapped(), 0..) |pg, k| fill(&h, &p, @intCast(k), pg, 1);
+        const fp = try familyPages(gpa, &p, a.mapped(), 0, true);
+        defer freePages(gpa, fp);
+        const src: disk.WriteSrc = .{ .key = @splat(1), .tag = 4, .page = 256, .pos = pos, .npages = a.len, .ids = ids, .store = h.store(), .families = &fams, .pages = fp, .blobs = &.{.{ .name = "rings", .bytes = &blob }} };
+        written = try d.writeFile(&src);
+        _ = try d.register(&src, written);
+        logical = d.used;
+        // a rank of a split pair stores its own pages, so the file is smaller than the replicated one
+        try testing.expect(written > logical);
+    }
+
+    // a new process on the same tier: the stale temporary file goes, this rank's own file is indexed
+    {
+        const d = try disk.Disk.open(gpa, io, .{ .root = root, .compat = @splat(9), .rank = rank, .world = world, .chunk = 3 * 74_752, .staging = 3, .lanes = 3, .min_tokens = 1 });
+        defer d.close();
+        const tf = try d.dir.createFile(io, "stale.tmp", .{});
+        tf.close(io);
+        var found: std.ArrayList(disk.Disk.Found) = .empty;
+        defer {
+            for (found.items) |f| gpa.free(f.ids);
+            found.deinit(gpa);
+        }
+        try d.scan(&found);
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqual(@as(usize, 1), d.recs.items.len);
+        // reconcile charges a file as it is written (park charges the logical rows; see disk_charge.zig)
+        try testing.expectEqual(written, d.used);
+        try testing.expectError(error.FileNotFound, d.dir.openFile(io, "stale.tmp", .{}));
+    }
 }
 
 test "logical charge counts delta pages and bounded measure independently of blob and padded file bytes" {
