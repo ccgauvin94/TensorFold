@@ -441,9 +441,13 @@ pub const Disk = struct {
     };
 
     /// Indexes the directory on restart: drops .tmp and bad files, checks ids, registers bases before their deltas.
+    ///
+    /// Split ranks reconcile too: a file holds one rank's rows of a logical page range, its header names the
+    /// logical range (first_page, npages) and its own rank, so every rank can index its own directory. The pair
+    /// still agrees at restore time (lockstep: an operation is done only where every rank says so), so a file
+    /// set one rank lacks cannot restore anything on its own.
     pub fn scan(d: *Disk, out: *std.ArrayList(Found)) !void {
         if (@import("builtin").os.tag != .linux) return error.UnsupportedPlatform;
-        if (d.opts.world > 1) return error.SplitReconcileUnsupported;
         var it = d.dir.iterate();
         var nb: [48]u8 = undefined;
         while (try it.next(d.io)) |ent| {

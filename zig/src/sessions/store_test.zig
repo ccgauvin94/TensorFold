@@ -162,16 +162,12 @@ fn scenario(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32, asy
     while (id != store_mod.none) : (id = r.store.entry(id).extra.newer) for (r.store.entry(id).extra.pages) |pg| try trace.append(gpa, pg);
 }
 
-/// After the scenario: a new process on the same tier finds every file and resumes chat 1 through its delta chain.
+/// After the scenario: a new process on the same tier finds every file and resumes chat 1 through its delta chain,
+/// on one rank or on each rank of a split pair (each indexes its own directory and restores its own rows).
 fn restart(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32) !void {
     var r: Rank = undefined;
     try r.init(gpa, root, world, rank, .{ .chats = 1 });
     defer r.deinit();
-    if (world > 1) {
-        try testing.expectError(error.SplitReconcileUnsupported, r.store.reconcile());
-        try testing.expectEqual(@as(u64, 0), r.disk.used);
-        return;
-    }
     try testing.expectEqual(@as(u32, 4), try r.store.reconcile());
     const s = try r.pool.newSlot(64 * page);
     const a = try chatIds(gpa, 1, 20 * page);
