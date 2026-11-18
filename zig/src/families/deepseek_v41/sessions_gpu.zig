@@ -205,6 +205,15 @@ pub const Sessions = struct {
         }
         errdefer if (s.disk) |dd| dd.close();
         s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, policy(o));
+        // A kept tier exists to be reused: index what earlier processes wrote, so this one can resume it.
+        // A damaged chain must not cost the boot: it stops the walk, the files it did index stay usable.
+        if (s.disk != null and flag("TF_DSV41_SESSION_KEEP_DISK")) {
+            const kept = s.store.reconcile() catch |e| blk: {
+                std.log.scoped(.dsv41).warn("sessions: disk tier reconcile stopped at {s}; the rest stays unindexed", .{@errorName(e)});
+                break :blk 0;
+            };
+            if (kept > 0) std.log.scoped(.dsv41).info("sessions: reconciled {d} file(s) from an earlier process", .{kept});
+        }
         errdefer s.store.deinit();
         if (f.comm.world() > 1) s.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
         f.sess = .{ .ptr = s, .reserve = reserveFn, .commit = commitFn, .save = saveFn, .restore = restoreFn, .reset = resetFn, .prompt = promptFn, .admit = admitFn };
