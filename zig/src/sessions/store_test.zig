@@ -216,6 +216,43 @@ test "two split ranks make the same decisions on the same calls and each restore
     try testing.expectEqualSlices(u64, t0.items, t1.items);
 }
 
+test "a slot number is a rank's own: a freed slot reused for another chat leaves every key naming its entry" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(gpa, &tmp, "slots");
+    defer gpa.free(root);
+    var r: Rank = undefined;
+    try r.init(gpa, root, 1, 0, .{ .chats = 1 });
+    defer r.deinit();
+    const s = try r.pool.newSlot(64 * page);
+    const a = try chatIds(gpa, 1, 8 * page);
+    defer gpa.free(a);
+    const b = try chatIds(gpa, 2, 8 * page);
+    defer gpa.free(b);
+    const c = try chatIds(gpa, 3, 8 * page);
+    defer gpa.free(c);
+    const n = 4 * page + 7;
+    _ = try turn(gpa, &r, s, 1, a[0..n]);
+    _ = try turn(gpa, &r, s, 2, b[0..n]);
+    const one = (try r.store.find(1, a[0 .. n + 1])).?;
+    const two = (try r.store.find(1, b[0 .. n + 1])).?;
+    try testing.expect(one.id != two.id and !one.ram);
+    const two_key = r.store.entry(two.id).key;
+    // One rank's disk budget deletes a file the other keeps (the tiers trim per rank), so it forgets the entry and
+    // frees its slot; a later park takes that slot. From here on the leader's number names a different entry here.
+    try r.store.forget(one.id);
+    _ = try turn(gpa, &r, s, 3, c[0..n]);
+    const three = (try r.store.find(1, c[0 .. n + 1])).?;
+    try testing.expectEqual(one.id, three.id); // the number moved: chat 3 sits in chat 1's old slot
+    // That is exactly the miss a restore hits (NotTheEntry): the number it was sent no longer holds the entry.
+    try testing.expect(!r.store.index.holds(one.id, two.pos, two_key));
+    // The key is what every rank computes alike, so resolving it names the entry the restore means.
+    const local = r.store.index.lookup(two_key) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(two.id, local);
+    try testing.expect(r.store.index.holds(local, two.pos, two_key));
+}
+
 test "historyOf: a RAM entry's ids come from the index, an NVMe entry's only from the prompt that names it" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});

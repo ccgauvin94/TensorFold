@@ -513,9 +513,18 @@ pub const Sessions = struct {
         return s.restoreAs(id, null, ids);
     }
 
-    pub fn restoreAs(s: *Sessions, id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !bool {
+    pub fn restoreAs(s: *Sessions, given_id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !bool {
         if (s.f.slot.pos != 0 or s.kx.slot.len != 0) return error.SlotNotEmpty;
         try s.active();
+        // An id is a slot in THIS rank's index, and free slots are reused. A rank that trimmed, dropped or
+        // failed to park a different set hands the same entry a different slot than the leader does, so the
+        // entry is named by its key — the one thing every rank computes alike — and the leader's slot is
+        // only the fallback for a call that carries no key.
+        const id = if (want) |w| blk: {
+            const k = s.store.index.lookup(w.key) orelse break :blk given_id;
+            if (k != given_id and !quiet) std.log.scoped(.dsv41).info("sessions: a {d}-token entry is slot {d} here and {d} on the leader; restoring by key", .{ w.pos, k, given_id });
+            break :blk k;
+        } else given_id;
         const pos = if (want) |w| w.pos else s.store.entry(id).pos;
         const g: ?lockstep.Agree = if (s.agreement) |*a| blk: {
             const x = a.agree();
