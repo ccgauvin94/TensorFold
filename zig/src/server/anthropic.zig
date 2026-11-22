@@ -115,6 +115,8 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     // content the last round produced.
     var blocks: std.ArrayList(Value) = .empty;
     var rounds: usize = 0;
+    // names this request has already defined: a second search that finds one again must not restate its schema
+    var defined: std.StringHashMapUnmanaged(void) = .empty;
     while (true) : (rounds += 1) {
         var reply: Reply = .{ .a = a, .conn = conn, .model = openai.replyModel(srv, prepared[1]) };
         reply.init() catch return;
@@ -127,9 +129,12 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             const message = if (problem == .object) (if (problem.get("message")) |m| (if (m == .string) m.string else "request failed") else "request failed") else (if (problem == .string) problem.string else "request failed");
             return sendError(conn, a, message, wire.status.?);
         }
-        const answered = answerSearchRound(a, srv, &blocks, declared, payload, chat_body) catch return;
+        const answered = answerSearchRound(a, srv, &blocks, declared, payload, chat_body, &defined) catch return;
         if (answered) {
-            if (rounds >= max_search_rounds) return sendError(conn, a, "the model kept searching for tools without answering", 503);
+            if (rounds >= max_search_rounds) {
+                const message = std.fmt.allocPrint(a, "the model searched for tools {d} times without calling one. The tools it found are now callable, so retry the turn.", .{rounds + 1}) catch return;
+                return sendError(conn, a, message, 503);
+            }
             continue;
         }
         const whole = reply.completion(payload) catch |e| {
@@ -141,6 +146,17 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     }
 }
 
+/// The names in `names` this request has not defined yet, recorded as defined. An empty result means every tool the
+/// search found is already in the prompt — the caller says so instead of restating the schemas.
+fn freshNames(a: Allocator, defined: *std.StringHashMapUnmanaged(void), names: []const []const u8) Allocator.Error![]const []const u8 {
+    var fresh: std.ArrayList([]const u8) = .empty;
+    for (names) |name| {
+        if ((try defined.getOrPut(a, name)).found_existing) continue;
+        try fresh.append(a, name);
+    }
+    return fresh.items;
+}
+
 /// A streamed reply, including one that calls a search: the message is opened once and every round continues it,
 /// so the deltas reach the client as the model produces them instead of arriving together at the end.
 fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []const Value, chat_body: Value) void {
@@ -148,6 +164,8 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
     reply.init() catch return;
     var wire: Wire = .{ .reply = &reply };
     var rounds: usize = 0;
+    // names this request has already defined: a second search that finds one again must not restate its schema
+    var defined: std.StringHashMapUnmanaged(void) = .empty;
     while (true) : (rounds += 1) {
         reply.prose.clearRetainingCapacity();
         reply.search = null;
@@ -171,13 +189,22 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
         }
         const input = reply.search orelse return; // the runner closed the message
         if (rounds >= max_search_rounds) {
-            const e = errorValue(a, "the model kept searching for tools without answering", 503) catch return;
+            const e = errorValue(a, "the model searched for tools without calling one. The tools it found are now callable, so retry the turn.", 503) catch return;
             sse.event(conn, a, "error", e) catch {};
             return;
         }
         const variant: tool_search.Variant = if (input == .object and input.get("query") != null) .bm25 else .regex;
         const outcome = tool_search.run(a, declared, variant, input) catch return;
-        if (outcome == .found) tool_search.publish(declared, outcome.found);
+        // a discovered tool is published in place, so the NEXT round's tool block carries its definition and the
+        // model can call it; and each tool is defined once, however many rounds found it
+        var define: []const []const u8 = &.{};
+        switch (outcome) {
+            .found => |names| {
+                tool_search.publish(declared, names);
+                define = freshNames(a, &defined, names) catch return;
+            },
+            .failed => {},
+        }
         const id = std.fmt.allocPrint(a, "srvtoolu_{d}", .{rounds + 1}) catch return;
         // the call block is already on the wire; what the contract wants next is its result, whole
         const result_block = switch (outcome) {
@@ -185,7 +212,7 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
             .failed => |why| tool_search.failure(a, id, why) catch return,
         };
         reply.wholeBlock(result_block) catch return;
-        extendForSearch(a, srv, declared, chat_body, reply.prose.items, variant, input, outcome) catch return;
+        extendForSearch(a, srv, declared, chat_body, reply.prose.items, variant, input, outcome, define) catch return;
     }
 }
 
@@ -283,7 +310,7 @@ fn serverTool(declared: []const Value, name: []const u8) bool {
 /// Answers the search a finished round called, if it called one: appends the contract's two blocks to ``blocks``
 /// and extends ``body`` with the turns the continuation needs — the assistant turn it produced with the call
 /// rendered canonically, then the expansion. Returns false when the round called no server tool.
-fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), declared: []const Value, payload: Value, body: Value) !bool {
+fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), declared: []const Value, payload: Value, body: Value, defined: *std.StringHashMapUnmanaged(void)) !bool {
     const choices = payload.get("choices") orelse return false;
     if (choices != .array or choices.array.len == 0) return false;
     const message = choices.array[0].get("message") orelse return false;
@@ -308,7 +335,14 @@ fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), 
 
     const variant: tool_search.Variant = if (found.input == .object and found.input.get("query") != null) .bm25 else .regex;
     const outcome = try tool_search.run(a, declared, variant, found.input);
-    if (outcome == .found) tool_search.publish(declared, outcome.found);
+    var define: []const []const u8 = &.{};
+    switch (outcome) {
+        .found => |names| {
+            tool_search.publish(declared, names);
+            define = try freshNames(a, defined, names);
+        },
+        .failed => {},
+    }
     const id = try std.fmt.allocPrint(a, "srvtoolu_{d}", .{blocks.items.len + 1});
     try blocks.append(a, try tool_search.serverToolUse(a, id, found.name, found.input));
     switch (outcome) {
@@ -319,13 +353,13 @@ fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), 
     // the continuation: everything so far, then the assistant turn as the prompt will render it on replay, then the
     // expansion in the server's late-system role
     const prose = if (message.get("content")) |p| (if (p == .string) p.string else "") else "";
-    try extendForSearch(a, srv, declared, body, prose, variant, found.input, outcome);
+    try extendForSearch(a, srv, declared, body, prose, variant, found.input, outcome, define);
     return true;
 }
 
 /// Extends the request with what the continuation needs: the assistant turn as the prompt will render it on replay,
 /// then the expansion in the server's late-system role. Shared by the assembled and the streamed path.
-fn extendForSearch(a: Allocator, srv: *Server, declared: []const Value, body: Value, prose: []const u8, variant: tool_search.Variant, input: Value, outcome: tool_search.Outcome) Allocator.Error!void {
+fn extendForSearch(a: Allocator, srv: *Server, declared: []const Value, body: Value, prose: []const u8, variant: tool_search.Variant, input: Value, outcome: tool_search.Outcome, define: []const []const u8) Allocator.Error!void {
     const messages = body.get("messages") orelse Value{ .array = &.{} };
     var out: std.ArrayList(Value) = .empty;
     if (messages == .array) for (messages.array) |m| try out.append(a, m);
@@ -338,8 +372,24 @@ fn extendForSearch(a: Allocator, srv: *Server, declared: []const Value, body: Va
     try out.append(a, .{ .object = turn });
     switch (outcome) {
         .found => |names| {
-            const derived = try tool_search.derive(a, srv.late_system, declared, variant, input, names);
-            try out.append(a, derived.expansion);
+            if (define.len == 0) {
+                // the search matched, but every tool it found is already in the prompt: restating the schema is what
+                // made the model read the same definition over and over and keep searching
+                const leaf: []const u8 = if (variant == .bm25) "query" else "pattern";
+                const asked = if (input == .object) (input.strField(leaf) orelse "") else "";
+                const text = try std.fmt.allocPrint(a, "Tool search ({s} \"{s}\") matched {d} tool{s} that {s} already available in your tool list. Nothing was added: call one directly.", .{
+                    leaf,                                  asked,
+                    names.len,                             if (names.len == 1) "" else "s",
+                    if (names.len == 1) "is" else "are",
+                });
+                const note = try json.newObject(a);
+                try note.put(a, "role", .{ .string = srv.late_system });
+                try note.put(a, "content", .{ .string = text });
+                try out.append(a, .{ .object = note });
+            } else {
+                const derived = try tool_search.derive(a, srv.late_system, declared, variant, input, define);
+                try out.append(a, derived.expansion);
+            }
         },
         // A search that could not run has to say so in the prompt: without it the continuation
         // reads as silence, and a model that asked for a tool simply stops.

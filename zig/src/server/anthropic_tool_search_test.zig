@@ -4,7 +4,20 @@ const std = @import("std");
 const json = @import("json");
 const errors = @import("errors.zig");
 const tool_specs = @import("tool_specs.zig");
+const search = @import("tool_search.zig");
 const translate = @import("anthropic_translate.zig").translate;
+
+fn args(a: std.mem.Allocator, text: []const u8) !json.Value {
+    return switch (json.parse(a, text) catch return error.Parse) {
+        .ok => |v| v,
+        .err => return error.Parse,
+    };
+}
+
+fn has(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
 
 const head = "{\"model\":\"m\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":";
 
@@ -117,4 +130,32 @@ test "the search tool's description names no tools: the client publishes them" {
     try std.testing.expect(std.mem.indexOf(u8, said, "get_weather") == null);
     try std.testing.expect(std.mem.indexOf(u8, said, "send_email") == null);
     try std.testing.expect(std.mem.indexOf(u8, said, "Search the tools this request deferred") != null);
+}
+
+test "a discovered tool is published, so the next round's tool block carries it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try chat(a, "[{\"type\":\"tool_search_tool_regex_20251119\"}," ++
+        "{\"name\":\"get_weather\",\"description\":\"Get the current weather for a location\",\"input_schema\":{\"type\":\"object\"},\"defer_loading\":true}]");
+    var cx: errors.Cx = .{ .a = a };
+    const declared = try tool_specs.active(&cx, body.get("tools"), null);
+    try std.testing.expectEqual(@as(usize, 1), (try tool_specs.published(a, declared)).len);
+
+    // the search finds it, and publishing clears its defer_loading IN PLACE — the chat body's own entry, which is
+    // what the next round renders from. The name lives under `function`, and a top-level lookup misses it silently:
+    // the tool then stays deferred for the rest of the request and the model searches for it over and over.
+    const found = switch (try search.run(a, declared, .regex, try args(a, "{\"pattern\":\"weather\"}"))) {
+        .found => |names| names,
+        .failed => return error.SearchFailed,
+    };
+    try std.testing.expect(has(found, "get_weather"));
+    search.publish(declared, found);
+
+    const shown = try tool_specs.published(a, declared);
+    try std.testing.expectEqual(@as(usize, 2), shown.len);
+    try std.testing.expect(!tool_specs.anyDeferred(declared));
+    // and the entry the chat body holds is the one that changed, not a copy
+    const body_tools = body.get("tools").?.array;
+    try std.testing.expect(!tool_specs.deferred(body_tools[1]));
 }
