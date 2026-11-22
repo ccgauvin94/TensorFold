@@ -561,12 +561,24 @@ pub fn isPlaceholder(m: Value) bool {
     return std.mem.eql(u8, role, placeholder);
 }
 
+/// The name a tool entry is declared under. A chat-body tool nests it under ``function``; an entry that never
+/// went through translate carries it at the top level. Getting this wrong is silent: every lookup simply misses,
+/// and a discovered tool stays deferred for ever (which reads as the model searching for it over and over).
+pub fn declaredName(tool: Value) []const u8 {
+    if (tool != .object) return "";
+    if (tool.get("function")) |function| if (function == .object) {
+        if (function.get("name")) |n| if (n == .string) return n.string;
+    };
+    if (tool.get("name")) |n| if (n == .string) return n.string;
+    return "";
+}
+
 /// Clears ``defer_loading`` on the tools a search returned, in place: the request's tool entries are
 /// shared with the chat body, so the template sees them as published.
 pub fn publish(tools: []const Value, names: []const []const u8) void {
     for (tools) |tool| {
         if (tool != .object) continue;
-        const name = tool.strField("name") orelse continue;
+        const name = declaredName(tool);
         for (names) |found| {
             if (!std.mem.eql(u8, name, found)) continue;
             _ = tool.object.orderedRemove("defer_loading");
