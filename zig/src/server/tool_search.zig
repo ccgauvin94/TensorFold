@@ -620,13 +620,30 @@ pub fn resolve(a: Allocator, cx: *errors.Cx, messages: Value, role: []const u8, 
             }
         }
 
-        const refs_value = m.get("references") orelse Value{ .array = &.{} };
-        if (refs_value != .array) return cx.refuse("a tool search result must list its references");
-        const refs = try a.alloc([]const u8, refs_value.array.len);
-        for (refs_value.array, refs) |item, *slot| {
-            const name = if (item == .object) (item.strField("tool_name") orelse "") else "";
-            if (name.len == 0) return cx.refuse("a tool reference must name its tool");
-            slot.* = name;
+        // A search marked lost never got its result into the transcript: the turn was cut before it arrived, or
+        // the client recorded two searches and answered only one. The engine ran that search once, so it can run
+        // it again from the request's own tool list, and the replay then reads exactly as the live turn did.
+        var refs: []const []const u8 = &.{};
+        if (json.truthyField(m, "lost")) {
+            switch (try run(a, tools, variantOf(input), input)) {
+                .found => |names| refs = names,
+                .failed => |why| {
+                    const text = try std.fmt.allocPrint(a, "Tool search failed ({s}): {s}. Nothing was added; use the tools you can already see.", .{ why.code, why.message });
+                    out.items[out.items.len - 1] = try withCall(a, previous, try callText(a, variantOf(input), input));
+                    try out.append(a, try plainMessage(a, role, text));
+                    continue;
+                },
+            }
+        } else {
+            const refs_value = m.get("references") orelse Value{ .array = &.{} };
+            if (refs_value != .array) return cx.refuse("a tool search result must list its references");
+            const listed = try a.alloc([]const u8, refs_value.array.len);
+            for (refs_value.array, listed) |item, *slot| {
+                const name = if (item == .object) (item.strField("tool_name") orelse "") else "";
+                if (name.len == 0) return cx.refuse("a tool reference must name its tool");
+                slot.* = name;
+            }
+            refs = listed;
         }
         // the contract's other 400: a reference with no definition in this request
         if (missing(tools, refs)) |name| return cx.fail(.request, "Tool reference '{s}' not found in available tools", .{name});

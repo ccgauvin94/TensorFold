@@ -181,7 +181,15 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
                 // Anthropic deferred loading: the engine ran this call, so it never reaches the client and the
                 // prompt carries its inputs as a canonical line. The assistant turn is cut here and a placeholder
                 // marks where the expansion goes once the request's tools are known (tool_search.resolve).
-                if (search_at != null) return cx.refuse("a tool search call must be followed by its result before another");
+                // The contract puts a result straight after its call. A transcript can still carry the call
+                // without one: a reply cut before the result arrived, or a client that recorded two searches
+                // and answered only the second. Refusing the whole conversation over that makes the session
+                // permanently unusable, so the placeholder is marked and tool_search.resolve runs the search
+                // itself when the request's tools are known.
+                if (search_at) |previous| {
+                    try out.items[previous].object.put(a, "lost", .{ .bool = true });
+                    search_at = null;
+                }
                 // The turn is emitted even when the model wrote no prose before the search: the canonical call
                 // line is folded into it, so there has to be a turn to fold it into.
                 const item = try json.newObject(a);
@@ -241,6 +249,11 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
                 try m.put(a, "content", if (has_image) .{ .array = result_parts.items } else .{ .string = text });
                 try out.append(a, .{ .object = m });
             } else return cx.fail(.request, "unsupported {s} content block type {s}", .{ role, try pyrepr.repr(a, kind) });
+        }
+        // a search that opened the turn's tail never got its result either
+        if (search_at) |previous| {
+            try out.items[previous].object.put(a, "lost", .{ .bool = true });
+            search_at = null;
         }
         if (content.items.len > 0 or calls.items.len > 0 or any_thought) {
             const item = try json.newObject(a);

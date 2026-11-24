@@ -293,6 +293,48 @@ test "a replayed assistant turn is cut at the search, as the live request wrote 
     try std.testing.expectEqualStrings("tool", msgs[4].get("role").?.string);
 }
 
+test "a turn that asked for two searches and got one result is answered, not refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The shape a reply could leave behind when the model batched discovery: two calls, one result. The
+    // contract's own reading of that is a 400, and every later turn in the session inherits it.
+    const body = try args(a,
+        \\{"model":"m","max_tokens":64,
+        \\ "tools":[{"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"},
+        \\          {"name":"get_weather","description":"Get the current weather","input_schema":{"type":"object"},"defer_loading":true},
+        \\          {"name":"send_email","description":"Send a message","input_schema":{"type":"object"},"defer_loading":true}],
+        \\ "messages":[{"role":"user","content":"weather and mail?"},
+        \\  {"role":"assistant","content":[
+        \\    {"type":"server_tool_use","id":"srvtoolu_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}},
+        \\    {"type":"server_tool_use","id":"srvtoolu_2","name":"tool_search_tool_regex","input":{"pattern":"mail"}},
+        \\    {"type":"tool_search_tool_result","tool_use_id":"srvtoolu_2","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"send_email"}]}}]},
+        \\  {"role":"user","content":"thanks"}]}
+    );
+
+    var cx: errors.Cx = .{ .a = a };
+    const chat = try translate(&cx, body, false);
+    const declared = try tool_specs.active(&cx, chat.get("tools"), null);
+    const resolved = try search.resolve(a, &cx, chat.get("messages").?, "system", declared);
+
+    // both searches read as searches: the one whose result went missing is run again from the request's own
+    // tool list, so the replay says what the live turn would have said
+    var calls: usize = 0;
+    for (resolved.array) |m| {
+        if (m.get("content")) |content| if (content == .array) for (content.array) |part| {
+            const text = part.get("text") orelse continue;
+            if (text != .string or !std.mem.startsWith(u8, text.string, "Tool search: pattern=")) continue;
+            calls += 1;
+        };
+        try std.testing.expect(m.strField("role") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    // and both tools are loaded from here on, including the one only the lost result had found
+    try std.testing.expect(!tool_specs.deferred(declared[1]));
+    try std.testing.expect(!tool_specs.deferred(declared[2]));
+}
+
 test "the gate sees what a request asks for and nothing else" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

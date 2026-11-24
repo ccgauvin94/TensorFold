@@ -115,6 +115,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     // content the last round produced.
     var blocks: std.ArrayList(Value) = .empty;
     var rounds: usize = 0;
+    var seq: usize = 0;
     // names this request has already defined: a second search that finds one again must not restate its schema
     var defined: std.StringHashMapUnmanaged(void) = .empty;
     while (true) : (rounds += 1) {
@@ -129,7 +130,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             const message = if (problem == .object) (if (problem.get("message")) |m| (if (m == .string) m.string else "request failed") else "request failed") else (if (problem == .string) problem.string else "request failed");
             return sendError(conn, a, message, wire.status.?);
         }
-        const answered = answerSearchRound(a, srv, &blocks, declared, payload, chat_body, &defined) catch return;
+        const answered = answerSearchRound(a, srv, &blocks, &seq, declared, payload, chat_body, &defined) catch return;
         if (answered) {
             if (rounds >= max_search_rounds) {
                 const message = std.fmt.allocPrint(a, "the model searched for tools {d} times without calling one. The tools it found are now callable, so retry the turn.", .{rounds + 1}) catch return;
@@ -164,11 +165,9 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
     reply.init() catch return;
     var wire: Wire = .{ .reply = &reply };
     var rounds: usize = 0;
-    // names this request has already defined: a second search that finds one again must not restate its schema
-    var defined: std.StringHashMapUnmanaged(void) = .empty;
     while (true) : (rounds += 1) {
         reply.prose.clearRetainingCapacity();
-        reply.search = null;
+        reply.searches.clearRetainingCapacity();
         // Each round numbers its tool calls from zero again, and a finished call is skipped when the
         // stream drains — so a call in round two would be swallowed by round one's entry and never
         // reach the client. The block index keeps counting; the calls start over.
@@ -187,32 +186,15 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
             const whole = reply.completion(wire.payload) catch return;
             return routes.sendValue(conn, a, 200, whole);
         }
-        const input = reply.search orelse return; // the runner closed the message
+        if (reply.searches.items.len == 0) return; // the runner closed the message
         if (rounds >= max_search_rounds) {
             const e = errorValue(a, "the model searched for tools without calling one. The tools it found are now callable, so retry the turn.", 503) catch return;
             sse.event(conn, a, "error", e) catch {};
             return;
         }
-        const variant: tool_search.Variant = if (input == .object and input.get("query") != null) .bm25 else .regex;
-        const outcome = tool_search.run(a, declared, variant, input) catch return;
-        // a discovered tool is published in place, so the NEXT round's tool block carries its definition and the
-        // model can call it; and each tool is defined once, however many rounds found it
-        var define: []const []const u8 = &.{};
-        switch (outcome) {
-            .found => |names| {
-                tool_search.publish(declared, names);
-                define = freshNames(a, &defined, names) catch return;
-            },
-            .failed => {},
-        }
-        const id = std.fmt.allocPrint(a, "srvtoolu_{d}", .{rounds + 1}) catch return;
-        // the call block is already on the wire; what the contract wants next is its result, whole
-        const result_block = switch (outcome) {
-            .found => |names| tool_search.result(a, id, names) catch return,
-            .failed => |why| tool_search.failure(a, id, why) catch return,
-        };
-        reply.wholeBlock(result_block) catch return;
-        extendForSearch(a, srv, declared, chat_body, reply.prose.items, variant, input, outcome, define) catch return;
+        // every search the round made is answered on the wire already; the continuation just needs each one's
+        // canonical call line and expansion, in the order the model asked
+        for (reply.searches.items) |s| extendForSearch(a, srv, declared, chat_body, s.prose, s.variant, s.input, s.outcome, s.define) catch return;
     }
 }
 
@@ -288,8 +270,14 @@ fn emitAsSse(conn: *Conn, a: Allocator, whole: Value) void {
     sse.event(conn, a, "message_stop", .{ .object = end }) catch return;
 }
 
-/// A search call the model made in a round: the id it gave, the tool it named, and its inputs.
-const SearchCall = struct { id: Value, name: []const u8, input: Value };
+/// A search a round answered: kept so the round loop can extend the continuation with it once the round is over.
+const AnsweredSearch = struct {
+    prose: []const u8,
+    variant: tool_search.Variant,
+    input: Value,
+    outcome: tool_search.Outcome,
+    define: []const []const u8,
+};
 
 /// How many searches one reply may make before it must answer (`--tool-search`): enough for a couple of hops, few
 /// enough that a model that keeps searching cannot spin.
@@ -310,14 +298,17 @@ fn serverTool(declared: []const Value, name: []const u8) bool {
 /// Answers the search a finished round called, if it called one: appends the contract's two blocks to ``blocks``
 /// and extends ``body`` with the turns the continuation needs — the assistant turn it produced with the call
 /// rendered canonically, then the expansion. Returns false when the round called no server tool.
-fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), declared: []const Value, payload: Value, body: Value, defined: *std.StringHashMapUnmanaged(void)) !bool {
+fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), seq: *usize, declared: []const Value, payload: Value, body: Value, defined: *std.StringHashMapUnmanaged(void)) !bool {
     const choices = payload.get("choices") orelse return false;
     if (choices != .array or choices.array.len == 0) return false;
     const message = choices.array[0].get("message") orelse return false;
     const calls = message.get("tool_calls") orelse return false;
     if (calls != .array or calls.array.len == 0) return false;
 
-    var call: ?SearchCall = null;
+    // a round can ask for more than one search: each gets its own call and result blocks, in the order the
+    // model made them, or the transcript pairs the first call with the second result and the rest is refused
+    const prose = if (message.get("content")) |p| (if (p == .string) p.string else "") else "";
+    var answered = false;
     for (calls.array) |entry| {
         const function = entry.get("function") orelse continue;
         if (function != .object) continue;
@@ -328,33 +319,30 @@ fn answerSearchRound(a: Allocator, srv: *Server, blocks: *std.ArrayList(Value), 
             .ok => |v| v,
             .err => Value.null,
         } else raw;
-        call = .{ .id = entry.get("id") orelse Value.null, .name = name.string, .input = input };
-        break;
-    }
-    const found = call orelse return false;
 
-    const variant: tool_search.Variant = if (found.input == .object and found.input.get("query") != null) .bm25 else .regex;
-    const outcome = try tool_search.run(a, declared, variant, found.input);
-    var define: []const []const u8 = &.{};
-    switch (outcome) {
-        .found => |names| {
-            tool_search.publish(declared, names);
-            define = try freshNames(a, defined, names);
-        },
-        .failed => {},
+        const variant: tool_search.Variant = if (input == .object and input.get("query") != null) .bm25 else .regex;
+        const outcome = try tool_search.run(a, declared, variant, input);
+        var define: []const []const u8 = &.{};
+        switch (outcome) {
+            .found => |names| {
+                tool_search.publish(declared, names);
+                define = try freshNames(a, defined, names);
+            },
+            .failed => {},
+        }
+        seq.* += 1;
+        const id = try std.fmt.allocPrint(a, "srvtoolu_{d}", .{seq.*});
+        try blocks.append(a, try tool_search.serverToolUse(a, id, name.string, input));
+        switch (outcome) {
+            .found => |names| try blocks.append(a, try tool_search.result(a, id, names)),
+            .failed => |why| try blocks.append(a, try tool_search.failure(a, id, why)),
+        }
+        // the round's prose belongs to its first search; a later one continues straight from the previous
+        // result, exactly as the prompt renders it on replay
+        try extendForSearch(a, srv, declared, body, if (answered) "" else prose, variant, input, outcome, define);
+        answered = true;
     }
-    const id = try std.fmt.allocPrint(a, "srvtoolu_{d}", .{blocks.items.len + 1});
-    try blocks.append(a, try tool_search.serverToolUse(a, id, found.name, found.input));
-    switch (outcome) {
-        .found => |names| try blocks.append(a, try tool_search.result(a, id, names)),
-        .failed => |why| try blocks.append(a, try tool_search.failure(a, id, why)),
-    }
-
-    // the continuation: everything so far, then the assistant turn as the prompt will render it on replay, then the
-    // expansion in the server's late-system role
-    const prose = if (message.get("content")) |p| (if (p == .string) p.string else "") else "";
-    try extendForSearch(a, srv, declared, body, prose, variant, found.input, outcome, define);
-    return true;
+    return answered;
 }
 
 /// Extends the request with what the continuation needs: the assistant turn as the prompt will render it on replay,
@@ -469,9 +457,14 @@ const Reply = struct {
     declared: []const Value = &.{},
     /// The prose of the round in flight, which the continuation's assistant turn is built from.
     prose: std.ArrayList(u8) = .empty,
-    /// Set when this round called a search: the round loop answers it and runs another round on this same
-    /// reply, so the message stays open instead of being closed out at the round boundary.
-    search: ?Value = null,
+    /// The searches this round answered, in the order the model asked for them. A result goes out as soon as
+    /// its call completes, so the transcript always pairs them; the round loop then extends the continuation
+    /// with each search, in order, and runs another round on this same reply.
+    searches: std.ArrayList(AnsweredSearch) = .empty,
+    /// Names this request has already defined, so a second search that found one does not restate its schema.
+    defined: std.StringHashMapUnmanaged(void) = .empty,
+    /// `srvtoolu_N`: one number per search across every round of the request, so no two results share an id.
+    search_seq: usize = 0,
     base: *json.Object = undefined,
     index: i64 = -1,
     kind: ?[]const u8 = null,
@@ -550,6 +543,34 @@ const Reply = struct {
         try r.send("content_block_stop", closed);
     }
 
+    /// Runs the search a round called, emits its result straight after the call's own block, and records it for
+    /// the continuation. Publishing happens here as well, so the next round's tool block already carries what
+    /// this search found.
+    fn answerSearch(r: *Reply, input: Value) E!void {
+        const variant: tool_search.Variant = if (input == .object and input.get("query") != null) .bm25 else .regex;
+        const outcome = tool_search.run(r.a, r.declared, variant, input) catch {
+            r.problem = "the tool search could not run";
+            return error.Closed;
+        };
+        var define: []const []const u8 = &.{};
+        switch (outcome) {
+            .found => |names| {
+                tool_search.publish(r.declared, names);
+                define = freshNames(r.a, &r.defined, names) catch return error.Closed;
+            },
+            .failed => {},
+        }
+        r.search_seq += 1;
+        const id = std.fmt.allocPrint(r.a, "srvtoolu_{d}", .{r.search_seq}) catch return error.Closed;
+        const block = switch (outcome) {
+            .found => |names| tool_search.result(r.a, id, names) catch return error.Closed,
+            .failed => |why| tool_search.failure(r.a, id, why) catch return error.Closed,
+        };
+        try r.wholeBlock(block);
+        const prose = r.a.dupe(u8, r.prose.items) catch return error.Closed;
+        r.searches.append(r.a, .{ .prose = prose, .variant = variant, .input = input, .outcome = outcome, .define = define }) catch return error.Closed;
+    }
+
     fn text(r: *Reply, kind: []const u8, value: []const u8) E!void {        if (value.len == 0) return;
         if (std.mem.eql(u8, kind, "text")) r.prose.appendSlice(r.a, value) catch return error.Closed;
         if (r.active != null) {
@@ -581,9 +602,9 @@ const Reply = struct {
         const p = payload orelse {
             try r.drain(true);
             try r.close();
-            // a round that called a search is not the end of the message: the loop answers it and runs
-            // another round on this same reply, so closing out here would end the stream mid-reply
-            if (r.search != null) return;
+            // a round that called a search is not the end of the message: the loop extends the continuation
+            // and runs another round on this same reply, so closing out here would end the stream mid-reply
+            if (r.searches.items.len > 0) return;
             const d = json.newObject(r.a) catch return error.Closed;
             try r.put(d, "stop_reason", .{ .string = r.finish });
             try r.put(d, "stop_sequence", r.stop_sequence);
@@ -675,14 +696,17 @@ const Reply = struct {
             try r.close();
             call.done = true;
             r.active = null;
-            // a search the model asked for: the round loop answers it and continues this same message
+            // a search the model asked for is answered on the spot: the contract puts its result straight after
+            // its call, and a round may ask for several (the model batches discovery). Deferring the answer to
+            // the end of the round is what left the first call of such a batch without one, and a transcript in
+            // that shape is refused on every replay.
             if (server) {
                 const raw = call.arguments;
                 const input = if (raw.len == 0) Value{ .object = json.newObject(r.a) catch return error.Closed } else switch (json.parseText(r.a, raw) catch return error.Closed) {
                     .ok => |v| v,
                     .err => Value{ .object = json.newObject(r.a) catch return error.Closed },
                 };
-                r.search = input;
+                try r.answerSearch(input);
             }
             const pending = r.pending.items;
             r.pending = .empty;
