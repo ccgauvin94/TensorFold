@@ -167,6 +167,7 @@ fn streamed(srv: *Server, conn: *Conn, a: Allocator, body: Value, declared: []co
     var rounds: usize = 0;
     while (true) : (rounds += 1) {
         reply.prose.clearRetainingCapacity();
+        reply.prose_cursor = 0;
         reply.searches.clearRetainingCapacity();
         // Each round numbers its tool calls from zero again, and a finished call is skipped when the
         // stream drains — so a call in round two would be swallowed by round one's entry and never
@@ -461,6 +462,9 @@ const Reply = struct {
     /// its call completes, so the transcript always pairs them; the round loop then extends the continuation
     /// with each search, in order, and runs another round on this same reply.
     searches: std.ArrayList(AnsweredSearch) = .empty,
+    /// Where the round's prose was last cut: a search takes the prose since the previous one, exactly the way
+    /// the prompt cuts the assistant turn at each search on replay.
+    prose_cursor: usize = 0,
     /// Names this request has already defined, so a second search that found one does not restate its schema.
     defined: std.StringHashMapUnmanaged(void) = .empty,
     /// `srvtoolu_N`: one number per search across every round of the request, so no two results share an id.
@@ -567,7 +571,8 @@ const Reply = struct {
             .failed => |why| tool_search.failure(r.a, id, why) catch return error.Closed,
         };
         try r.wholeBlock(block);
-        const prose = r.a.dupe(u8, r.prose.items) catch return error.Closed;
+        const prose = r.a.dupe(u8, r.prose.items[r.prose_cursor..]) catch return error.Closed;
+        r.prose_cursor = r.prose.items.len;
         r.searches.append(r.a, .{ .prose = prose, .variant = variant, .input = input, .outcome = outcome, .define = define }) catch return error.Closed;
     }
 
