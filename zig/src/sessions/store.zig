@@ -412,6 +412,11 @@ pub const Store = struct {
     pub fn evict(s: *Store, id: u32) !?*Job {
         const e = s.index.get(id);
         if (e.extra.job != null) return null;
+        // Already out of RAM: another admission spilled it, or the ranks disagree about who still holds it.
+        // There is nothing to evict, and this used to fall through to beginPark, which raises NotParkable —
+        // a request-path error the TP follow treats as fatal. One stale spill id therefore took the whole
+        // engine down (rank 1, 2026-11-24T17:42, two ~200k admissions racing) instead of one entry being skipped.
+        if (!e.ram) return null;
         if (s.policy.skip_covered and (e.extra.covered_by or s.index.covered(id, .any))) {
             try s.drop(id);
             s.stats.covered_drops += 1;

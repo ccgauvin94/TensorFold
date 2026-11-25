@@ -420,6 +420,29 @@ test "wrong same-length RAM entry and absent id are refused before slot mutation
     _ = try slot.releaseAll();
 }
 
+test "evicting an entry that is already out of RAM skips it instead of failing" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(gpa, &tmp, "stale-spill");
+    defer gpa.free(root);
+    var r: Rank = undefined;
+    try r.init(gpa, root, 2, 0, .{});
+    defer r.deinit();
+    const slot = try r.pool.newSlot(64 * page);
+    const ids = try chatIds(gpa, 1, 5 * page + 1);
+    defer gpa.free(ids);
+    _ = try turn(gpa, &r, slot, 1, ids[0 .. ids.len - 1]);
+    const hit = (try r.store.find(1, ids)).?;
+    r.store.entry(hit.id).extra.bounded.?.logical_bytes = 3000;
+    const job = (try r.store.beginPark(hit.id)).?;
+    _ = try r.store.settle(job);
+    try testing.expect(!r.store.entry(hit.id).ram);
+    // planSpill hands out ids up front and applyAdmit evicts them later; by then another admission may have
+    // taken the entry out. That used to reach beginPark -> NotParkable, which the TP follow treats as fatal.
+    try testing.expect(try r.store.evict(hit.id) == null);
+}
+
 test "split parking refuses a physical-only bounded measure before submitting work" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
